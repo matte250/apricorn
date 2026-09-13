@@ -38,7 +38,7 @@ fn bedroom_renders_real_models_and_both_players() {
             scene
                 .meshes
                 .iter()
-                .map(|m| m.triangles.len())
+                .map(|m| m.primitives.len())
                 .sum::<usize>()
                 > 250
         );

@@ -118,9 +118,9 @@ fn bedroom_field_plane_is_covered_and_the_player_stands_at_the_centre() {
     let scene_view = field::scene_view(&view);
     let centre = scene_view
         .camera
-        .project(field::tile_position(position))
+        .project_fixed(field::tile_position(position))
         .unwrap();
-    assert!((centre[0] - 128.0).abs() < 1e-9 && (centre[1] - 96.0).abs() < 1e-9);
+    assert_eq!(&centre[..2], &[128, 96]);
     // With BG0 disabled the compositor shows the backdrop instead.
     let mut frame = LogicalFrame::default();
     frame.main.field = Some(view);

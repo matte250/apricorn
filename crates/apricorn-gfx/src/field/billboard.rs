@@ -34,8 +34,8 @@
 //! map-object agent's concern: a [`BillboardView`] takes a texture and
 //! the texel rectangle to show, and this module places it.
 
+use super::Projected;
 use super::camera::Camera;
-use super::{Projected, Surface, draw_triangle};
 use apricorn_core::field::model::Texture;
 
 /// One billboard to draw: a texel rectangle of `texture` on a
@@ -64,46 +64,38 @@ impl BillboardView<'_> {
     /// projection: bottom-left, bottom-right, top-right, top-left —
     /// `None` when the anchor is behind the eye.
     pub(crate) fn corners(&self, camera: &Camera) -> Option<[Projected; 4]> {
-        let anchor = camera.to_camera(self.world_pos);
-        let half_w = f64::from(self.size_px.0) / 2.0;
-        let h = f64::from(self.size_px.1);
+        let anchor = camera.to_camera_fixed(self.world_pos);
+        let half_w = i64::from(self.size_px.0) * 4096 / 2;
+        let h = i64::from(self.size_px.1) * 4096;
         let (u, v, w, rh) = (
-            f64::from(self.rect.0),
-            f64::from(self.rect.1),
-            f64::from(self.rect.2),
-            f64::from(self.rect.3),
+            i64::from(self.rect.0) * 16,
+            i64::from(self.rect.1) * 16,
+            i64::from(self.rect.2) * 16,
+            i64::from(self.rect.3) * 16,
         );
         // NNSi_G3dFuncSbc_BB: the local axes become the camera's, the
         // translation stays — so the quad lives in camera space at the
         // anchor's depth. A mirrored view swaps the left and right
         // texel columns.
-        let (u_left, u_right) = if self.mirrored { (u + w, u) } else { (u, u + w) };
+        let (u_left, u_right) = if self.mirrored {
+            (u + w, u)
+        } else {
+            (u, u + w)
+        };
         let corners = [
             ([anchor[0] - half_w, anchor[1], anchor[2]], [u_left, v + rh]),
-            ([anchor[0] + half_w, anchor[1], anchor[2]], [u_right, v + rh]),
+            (
+                [anchor[0] + half_w, anchor[1], anchor[2]],
+                [u_right, v + rh],
+            ),
             ([anchor[0] + half_w, anchor[1] + h, anchor[2]], [u_right, v]),
             ([anchor[0] - half_w, anchor[1] + h, anchor[2]], [u_left, v]),
         ];
         let mut out = [Projected::default(); 4];
         for (slot, (point, uv)) in out.iter_mut().zip(corners) {
-            let clip = camera.camera_to_clip(point, true);
-            *slot = Projected::from_clip(clip, uv, [31.0; 3])?;
+            let clip = camera.camera_to_clip_fixed(point, true);
+            *slot = Projected::from_clip(clip, uv, [0x1FF; 3])?;
         }
         Some(out)
-    }
-
-    /// Draws the billboard as two opaque, depth-writing triangles
-    /// (the quad's `[0, 1, 2], [0, 2, 3]` triangulation).
-    pub(crate) fn draw(&self, camera: &Camera, out: &mut [[u8; 4]], depth: &mut [f64]) {
-        let Some([bl, br, tr, tl]) = self.corners(camera) else {
-            return;
-        };
-        let surface = Surface {
-            texture: Some(self.texture),
-            flags: 0,
-            alpha: 31,
-        };
-        draw_triangle([bl, br, tr], &surface, true, out, depth);
-        draw_triangle([bl, tr, tl], &surface, true, out, depth);
     }
 }

@@ -18,7 +18,7 @@ use apricorn_core::field::{
     land::{self, LandData},
     map_header::{self, FollowMode, MapHeader, MapHeaders, MapType},
     matrix::{self, MapMatrix},
-    model::FX32_ONE,
+    model::{FX32_ONE, Primitive},
     ov01::{self, CameraPreset, CameraPresets, Ov01, SpriteModelTable},
     script_header::{self, InitScripts},
     terrain::TILE_BEHAVIOR_NONE,
@@ -94,12 +94,24 @@ fn map_headers_match_pret_and_the_pinned_address() {
     // `MAP_NEW_BARK_SOUTHWEST_HOUSE`): same flags, own banks.
     let h63 = headers.get(63).unwrap();
     assert_eq!(
-        (h63.matrix_id, h63.scripts_bank, h63.script_header_bank, h63.msg_bank, h63.events_bank),
+        (
+            h63.matrix_id,
+            h63.scripts_bank,
+            h63.script_header_bank,
+            h63.msg_bank,
+            h63.events_bank
+        ),
         (71, 845, 618, 545, 60)
     );
     let h65 = headers.get(65).unwrap();
     assert_eq!(
-        (h65.matrix_id, h65.scripts_bank, h65.script_header_bank, h65.msg_bank, h65.events_bank),
+        (
+            h65.matrix_id,
+            h65.scripts_bank,
+            h65.script_header_bank,
+            h65.msg_bank,
+            h65.events_bank
+        ),
         (66, 847, 620, 547, 62)
     );
     for h in [h63, h65] {
@@ -120,7 +132,15 @@ fn map_headers_match_pret_and_the_pinned_address() {
     assert_eq!((nb.matrix_id, nb.area_data_bank, nb.camera_type), (0, 2, 0));
     assert_eq!(nb.map_type, MapType::CityTown);
     assert_eq!(nb.follow_mode, FollowMode::Allow);
-    assert_eq!((nb.scripts_bank, nb.script_header_bank, nb.msg_bank, nb.events_bank), (842, 615, 542, 57));
+    assert_eq!(
+        (
+            nb.scripts_bank,
+            nb.script_header_bank,
+            nb.msg_bank,
+            nb.events_bank
+        ),
+        (842, 615, 542, 57)
+    );
     assert!(nb.has_wild_encounters() && !bedroom.has_wild_encounters());
     assert!(nb.bike_allowed && nb.fly_allowed && !nb.escape_rope_allowed);
 
@@ -133,13 +153,23 @@ fn map_headers_match_pret_and_the_pinned_address() {
     for (id, h) in headers.iter().enumerate() {
         assert!(usize::from(h.matrix_id) < matrices, "map {id} matrix");
         assert!(usize::from(h.scripts_bank) < scripts, "map {id} scripts");
-        assert!(usize::from(h.script_header_bank) < scripts, "map {id} script header");
+        assert!(
+            usize::from(h.script_header_bank) < scripts,
+            "map {id} script header"
+        );
         assert!(usize::from(h.events_bank) < events, "map {id} events");
         assert!(usize::from(h.area_data_bank) < areas, "map {id} area");
         assert!(usize::from(h.msg_bank) < msgs, "map {id} msg");
-        assert!(usize::from(h.camera_type) < ov01::CAMERA_PRESET_COUNT, "map {id} camera");
+        assert!(
+            usize::from(h.camera_type) < ov01::CAMERA_PRESET_COUNT,
+            "map {id} camera"
+        );
         assert!(h.mapsec <= MAX_MAPSEC, "map {id} mapsec");
-        assert_eq!(MapHeader::parse(&h.encode()).unwrap(), *h, "map {id} roundtrip");
+        assert_eq!(
+            MapHeader::parse(&h.encode()).unwrap(),
+            *h,
+            "map {id} roundtrip"
+        );
     }
     assert_eq!(map_header::record_address(BEDROOM), 0x020F_71E0);
 }
@@ -147,7 +177,10 @@ fn map_headers_match_pret_and_the_pinned_address() {
 #[test]
 fn matrices_parse_and_the_bedroom_is_one_cell() {
     let Some(store) = open() else { return };
-    assert_eq!(store.member_count(matrix::MATRIX_NARC).unwrap(), matrix::MATRIX_COUNT);
+    assert_eq!(
+        store.member_count(matrix::MATRIX_NARC).unwrap(),
+        matrix::MATRIX_COUNT
+    );
     let m = MapMatrix::load(&store, 72, BEDROOM).unwrap();
     assert_eq!((m.width, m.height), (1, 1));
     assert!(!m.has_headers && !m.has_altitudes);
@@ -160,7 +193,10 @@ fn matrices_parse_and_the_bedroom_is_one_cell() {
     assert_eq!((world.width, world.height), (47, 17));
     assert_eq!(world.cell_count(), matrix::MAX_CELLS);
     assert!(world.has_headers && world.has_altitudes);
-    assert_eq!(world.header(NEW_BARK_CELL.0, NEW_BARK_CELL.1), Some(NEW_BARK));
+    assert_eq!(
+        world.header(NEW_BARK_CELL.0, NEW_BARK_CELL.1),
+        Some(NEW_BARK)
+    );
     assert_eq!(world.land_id(NEW_BARK_CELL.0, NEW_BARK_CELL.1), Some(0));
     assert_eq!(world.altitude(NEW_BARK_CELL.0, NEW_BARK_CELL.1), Some(0));
     assert_eq!(world.land_id(0, 0), Some(matrix::NO_LAND));
@@ -181,10 +217,16 @@ fn matrices_parse_and_the_bedroom_is_one_cell() {
 #[test]
 fn land_data_sections_and_attributes() {
     let Some(store) = open() else { return };
-    assert_eq!(store.member_count(land::LAND_NARC).unwrap(), land::LAND_COUNT);
+    assert_eq!(
+        store.member_count(land::LAND_NARC).unwrap(),
+        land::LAND_COUNT
+    );
     let bedroom = LandData::load(&store, 217).unwrap();
     let s = bedroom.sizes;
-    assert_eq!((s.attributes, s.props, s.model, s.bdhc, s.extra), (2048, 384, 6576, 144, 0));
+    assert_eq!(
+        (s.attributes, s.props, s.model, s.bdhc, s.extra),
+        (2048, 384, 6576, 144, 0)
+    );
     assert_eq!(bedroom.props.len(), 8);
     assert!(bedroom.extra.is_empty());
     assert_eq!(&bedroom.model[..4], b"BMD0");
@@ -213,7 +255,10 @@ fn land_data_sections_and_attributes() {
     assert_eq!((nb.sizes.props, nb.sizes.extra), (816, 88));
     assert_eq!(nb.props.len(), 17);
     assert_eq!(nb.props[0].model_id, 21);
-    assert_eq!(nb.props[0].translation, [-24 * FX32_ONE, 16 * FX32_ONE, -128 * FX32_ONE]);
+    assert_eq!(
+        nb.props[0].translation,
+        [-24 * FX32_ONE, 16 * FX32_ONE, -128 * FX32_ONE]
+    );
     let doors: Vec<(usize, usize)> = (0..32)
         .flat_map(|z| (0..32).map(move |x| (x, z)))
         .filter(|&(x, z)| nb.attribute(x, z) == Some(0x8069))
@@ -239,16 +284,29 @@ fn land_data_sections_and_attributes() {
         assert!(l.sizes.bdhc > 0, "land {id} BDHC");
     }
     assert_eq!((props, max_props, with_extra), (2859, 30, 230));
-    assert_eq!((rotated, scaled), (0, 0), "retail never rotates or scales a prop");
+    assert_eq!(
+        (rotated, scaled),
+        (0, 0),
+        "retail never rotates or scales a prop"
+    );
 }
 
 #[test]
 fn area_data_selects_the_archives() {
     let Some(store) = open() else { return };
-    assert_eq!(store.member_count(area::AREA_NARC).unwrap(), area::AREA_COUNT);
+    assert_eq!(
+        store.member_count(area::AREA_NARC).unwrap(),
+        area::AREA_COUNT
+    );
     let a25 = AreaData::load(&store, 25).unwrap();
     assert_eq!(
-        (a25.building_set, a25.map_texture, a25.unknown, a25.outdoor, a25.light_selector),
+        (
+            a25.building_set,
+            a25.map_texture,
+            a25.unknown,
+            a25.outdoor,
+            a25.light_selector
+        ),
         (1, 25, 0xFFFF, 0, 0)
     );
     assert_eq!(a25.prop_model_narc(), area::BM_ROOM_NARC);
@@ -270,9 +328,15 @@ fn area_data_selects_the_archives() {
 #[test]
 fn events_and_script_headers() {
     let Some(store) = open() else { return };
-    assert_eq!(store.member_count(events::EVENTS_NARC).unwrap(), events::EVENTS_COUNT);
+    assert_eq!(
+        store.member_count(events::EVENTS_NARC).unwrap(),
+        events::EVENTS_COUNT
+    );
     let e = MapEvents::load(&store, 61).unwrap();
-    assert_eq!((e.bg.len(), e.objects.len(), e.warps.len(), e.coords.len()), (2, 3, 1, 0));
+    assert_eq!(
+        (e.bg.len(), e.objects.len(), e.warps.len(), e.coords.len()),
+        (2, 3, 1, 0)
+    );
     assert_eq!(e.warps[0].x, 3);
     assert_eq!(e.warps[0].z, 4);
     assert_eq!(e.warps[0].header, 63, "the stairs lead to the house's 1F");
@@ -291,13 +355,20 @@ fn events_and_script_headers() {
     let kinds: Vec<u8> = s615.records.iter().map(|r| r.kind).collect();
     assert_eq!(
         kinds,
-        vec![script_header::ON_FRAME_TABLE, script_header::ON_TRANSITION, script_header::ON_RESUME]
+        vec![
+            script_header::ON_FRAME_TABLE,
+            script_header::ON_TRANSITION,
+            script_header::ON_RESUME
+        ]
     );
     assert_eq!(s615.on_transition(), Some(7));
     assert_eq!(s615.on_resume(), Some(10));
     assert_eq!(s615.on_load(), None);
     assert_eq!(s615.frame_table.len(), 2);
-    assert_eq!((s615.frame_table[0].var_a, s615.frame_table[0].var_b), (0x4106, 1));
+    assert_eq!(
+        (s615.frame_table[0].var_a, s615.frame_table[0].var_b),
+        (0x4106, 1)
+    );
     assert_eq!(s615.frame_table[0].script_id, 4);
     let s618 = InitScripts::load(&store, 618).unwrap(); // house 1F
     assert_eq!(s618.records.len(), 1);
@@ -356,7 +427,12 @@ fn ov01_tables_read_from_the_overlay() {
     assert_eq!(sprites.entry(ov01::SPRITE_HERO).unwrap().packed, 0x1C60);
     assert_eq!(sprites.entries().len(), 901);
     let mmodels = store.member_count(ov01::MMODEL_NARC).unwrap();
-    assert!(sprites.entries().iter().all(|e| usize::from(e.mmodel_id) < mmodels));
+    assert!(
+        sprites
+            .entries()
+            .iter()
+            .all(|e| usize::from(e.mmodel_id) < mmodels)
+    );
 }
 
 #[test]
@@ -364,22 +440,45 @@ fn bedroom_scene_keeps_the_phase_4_shape() {
     let Some(store) = open() else { return };
     for gender in 0..2u8 {
         let scene = FieldScene::bedroom(&store, gender).unwrap();
-        assert_eq!(FieldScene::load(&store, BEDROOM, 6, 6, gender).unwrap(), scene);
+        assert_eq!(
+            FieldScene::load(&store, BEDROOM, 6, 6, gender).unwrap(),
+            scene
+        );
         assert_eq!(scene.map_id, BEDROOM);
         assert_eq!(scene.name, "T20R0202");
         assert_eq!(scene.header, bedroom_header());
         assert_eq!(scene.position, [6, 6]);
-        assert_eq!(scene.window, CellWindow { x0: 0, z0: 0, width: 1, height: 1 });
+        assert_eq!(
+            scene.window,
+            CellWindow {
+                x0: 0,
+                z0: 0,
+                width: 1,
+                height: 1
+            }
+        );
         assert_eq!(scene.cells.len(), 1);
         assert_eq!(scene.cells[0].land_id, 217);
         assert_eq!(scene.cells[0].origin, [256 << 12, 0, 256 << 12]);
         assert_eq!(scene.props.len(), 8);
-        assert!(scene.props.iter().all(|p| p.model_id == p.placement.model_id));
+        assert!(
+            scene
+                .props
+                .iter()
+                .all(|p| p.model_id == p.placement.model_id)
+        );
         let cell_meshes = scene.cells[0].meshes.len();
         let prop_meshes: usize = scene.props.iter().map(|p| p.meshes.len()).sum();
         assert_eq!(scene.meshes.len(), cell_meshes + prop_meshes);
         assert!(scene.meshes.len() > 8);
-        assert!(scene.meshes.iter().map(|m| m.triangles.len()).sum::<usize>() > 250);
+        assert!(
+            scene
+                .meshes
+                .iter()
+                .map(|m| m.primitives.len())
+                .sum::<usize>()
+                > 250
+        );
         assert_eq!(scene.camera.perspective_type, 1);
         assert_eq!(scene.camera.angle[0], 0xDC82);
         assert_eq!((scene.player.width, scene.player.height), (32, 32));
@@ -392,7 +491,12 @@ fn bedroom_scene_keeps_the_phase_4_shape() {
         assert!(scene.init_scripts.records.is_empty());
         assert!(scene.cell_at(6, 6).is_some() && scene.cell_at(32, 0).is_none());
         // Every world vertex lies inside the cell (0..512 units, y small).
-        for v in scene.meshes.iter().flat_map(|m| m.triangles.iter().flatten()) {
+        for v in scene
+            .meshes
+            .iter()
+            .flat_map(|m| m.primitives.iter())
+            .flat_map(|primitive| primitive.vertices())
+        {
             assert!((0..=512 << 12).contains(&v.position[0]));
             assert!((0..=512 << 12).contains(&v.position[2]));
             assert!(v.position[1].abs() < 128 << 12);
@@ -412,14 +516,29 @@ fn new_bark_town_loads_a_window_of_the_overworld() {
     assert_eq!(scene.name, "T20");
     assert_eq!(scene.matrix.id, 0);
     assert!(scene.area.is_outdoor());
-    assert_eq!(scene.window, CellWindow { x0: 20, z0: 11, width: 3, height: 3 });
+    assert_eq!(
+        scene.window,
+        CellWindow {
+            x0: 20,
+            z0: 11,
+            width: 3,
+            height: 3
+        }
+    );
     assert_eq!(LOAD_RADIUS, 1);
-    assert_eq!(scene.cells.len(), 9, "every cell around New Bark has land data");
+    assert_eq!(
+        scene.cells.len(),
+        9,
+        "every cell around New Bark has land data"
+    );
     let home = scene.cell_at(x, z).unwrap();
     assert_eq!((home.cell_x, home.cell_z), (21, 12));
     assert_eq!(home.map_id, NEW_BARK);
     assert_eq!(home.land_id, 0);
-    assert_eq!(home.origin, [(21 * 512 + 256) << 12, 0, (12 * 512 + 256) << 12]);
+    assert_eq!(
+        home.origin,
+        [(21 * 512 + 256) << 12, 0, (12 * 512 + 256) << 12]
+    );
     // The ocean cells to the north sit two altitude steps up.
     let north = scene.cell_at(x, z - 32).unwrap();
     assert_eq!(north.origin[1], 2 << 15);
@@ -431,12 +550,29 @@ fn new_bark_town_loads_a_window_of_the_overworld() {
     assert_eq!(home_props.len(), 17);
     assert!(scene.props.len() > 17);
     for p in &scene.props {
-        assert_eq!(p.model_id, p.placement.model_id, "every placement is in the building set");
-        let cell = scene.cells.iter().find(|c| [c.cell_x, c.cell_z] == p.cell).unwrap();
-        assert_eq!(p.translation[0], cell.origin[0] + p.placement.translation[0]);
+        assert_eq!(
+            p.model_id, p.placement.model_id,
+            "every placement is in the building set"
+        );
+        let cell = scene
+            .cells
+            .iter()
+            .find(|c| [c.cell_x, c.cell_z] == p.cell)
+            .unwrap();
+        assert_eq!(
+            p.translation[0],
+            cell.origin[0] + p.placement.translation[0]
+        );
         assert_eq!(p.translation[1], p.placement.translation[1]);
-        assert_eq!(p.translation[2], cell.origin[2] + p.placement.translation[2]);
-        assert!(!p.meshes.is_empty(), "prop model {} has geometry", p.model_id);
+        assert_eq!(
+            p.translation[2],
+            cell.origin[2] + p.placement.translation[2]
+        );
+        assert!(
+            !p.meshes.is_empty(),
+            "prop model {} has geometry",
+            p.model_id
+        );
     }
     // Model 27 (a rotated-node bm_field prop) is in the window and its
     // node transform moved geometry off the cell's model origin.
@@ -446,15 +582,37 @@ fn new_bark_town_loads_a_window_of_the_overworld() {
     // objects, 5 warps (the doors) and 4 coord triggers, all on New Bark's
     // cell; the player's front door leads to `MAP_NEW_BARK_PLAYER_HOUSE_1F`.
     let e = &scene.events;
-    assert_eq!((e.bg.len(), e.objects.len(), e.warps.len(), e.coords.len()), (5, 10, 5, 4));
-    assert_eq!((e.warps[1].x, e.warps[1].z, e.warps[1].header, e.warps[1].anchor), (695, 396, 63, 0));
+    assert_eq!(
+        (e.bg.len(), e.objects.len(), e.warps.len(), e.coords.len()),
+        (5, 10, 5, 4)
+    );
+    assert_eq!(
+        (
+            e.warps[1].x,
+            e.warps[1].z,
+            e.warps[1].header,
+            e.warps[1].anchor
+        ),
+        (695, 396, 63, 0)
+    );
     for w in &e.warps {
         let cell = scene.cell_at(i32::from(w.x), i32::from(w.z)).unwrap();
         assert_eq!(cell.map_id, NEW_BARK);
     }
     assert_eq!(scene.init_scripts.on_transition(), Some(7));
     assert_eq!(scene.position, [x, z]);
-    assert!(scene.meshes.iter().map(|m| m.triangles.len()).sum::<usize>() > 5000);
+    assert!(
+        scene
+            .meshes
+            .iter()
+            .flat_map(|mesh| &mesh.primitives)
+            .map(|primitive| match primitive {
+                Primitive::Triangle(_) => 1,
+                Primitive::Quad(_) => 2,
+            })
+            .sum::<usize>()
+            > 5000
+    );
 }
 
 #[test]

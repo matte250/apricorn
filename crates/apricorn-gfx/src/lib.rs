@@ -11,17 +11,17 @@
 //! Everything here is a pure function of the frame and the asset
 //! source — no time, no state, and integer arithmetic throughout the
 //! 2D path — so the same frame hashes the same pixels in the dump CLI,
-//! the golden tests, and the harness, forever. The one documented
-//! exception is the [`field`] (3D) layer, which uses `f64` with a fixed
-//! evaluation order and no transcendental call in its render path (the
-//! SDK's fixed-point sine table is regenerated once and pinned by
-//! SHA-1), and is therefore bit-identical across platforms too.
+//! the golden tests, and the harness, forever. The field's 3D layer is
+//! handled by [`gx3d`], whose viewport,
+//! scan-conversion, depth and attribute interpolation are integer-only.
 
 #![deny(missing_docs)]
 
 pub mod field;
+pub mod gx3d;
 pub mod raster;
 mod sprites;
 
 pub use field::{BillboardView, Camera, CameraPreset, SceneView, render_view};
+pub use gx3d::{Gx3dBuffer, Gx3dFrame};
 pub use raster::{AssetSource, ScreenBuffer, render};

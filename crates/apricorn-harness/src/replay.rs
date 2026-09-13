@@ -30,7 +30,7 @@ use std::path::{Path, PathBuf};
 use crate::HarnessError;
 use crate::engine::EngineRun;
 use crate::input::InputScript;
-use crate::oracle::{OracleRun, ProbeSpec, ShotRequest};
+use crate::oracle::{GxShotRequest, OracleRun, ProbeSpec, ShotRequest};
 use crate::pins::{PinMode, PinTable};
 use crate::regions::RegionSet;
 use crate::trace::Trace;
@@ -127,6 +127,32 @@ impl Case {
         shots: &ShotRequest,
     ) -> Result<Trace, HarnessError> {
         self.oracle_run(rom).run_with_shots(shots)
+    }
+
+    /// [`run_oracle`](Self::run_oracle), also writing the raw software
+    /// 3D planes requested by `shots` before 2D composition.
+    ///
+    /// # Errors
+    /// Propagates [`crate::oracle::OracleRun::run_with_gx_shots`]'s errors.
+    pub fn run_oracle_with_gx_shots(
+        &self,
+        rom: &Path,
+        shots: &GxShotRequest,
+    ) -> Result<Trace, HarnessError> {
+        self.oracle_run(rom).run_with_gx_shots(shots)
+    }
+
+    /// Runs the oracle while writing both composited and raw 3D artifacts.
+    ///
+    /// # Errors
+    /// Propagates [`crate::oracle::OracleRun::run_with_artifacts`]'s errors.
+    pub fn run_oracle_with_artifacts(
+        &self,
+        rom: &Path,
+        shots: &ShotRequest,
+        gx_shots: &GxShotRequest,
+    ) -> Result<Trace, HarnessError> {
+        self.oracle_run(rom).run_with_artifacts(shots, gx_shots)
     }
 
     /// Replays the case on the engine — the real `apricorn-core` game

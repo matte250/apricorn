@@ -19,10 +19,9 @@
 //! hashes of the canonical text files, computed here — they gate diff
 //! pairs, and only this side knows the canonical forms.
 //!
-//! A run can also ask for **screenshots** ([`ShotRequest`]): both LCDs
-//! as PNGs at the end of listed frames, passed through as the oracle's
-//! `--shots F,F,... --shots-dir DIR`. They are review artifacts (ground
-//! truth for engine renders) and never change the trace.
+//! A run can also ask for composited LCD screenshots ([`ShotRequest`])
+//! or raw software-3D planes ([`GxShotRequest`]). Both are frame-indexed
+//! review/test artifacts and never change the trace.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -80,15 +79,240 @@ impl ShotRequest {
     /// comma-separated.
     #[must_use]
     pub fn frames_arg(&self) -> String {
-        let mut frames = self.frames.clone();
-        frames.sort_unstable();
-        frames.dedup();
-        frames
-            .iter()
-            .map(u32::to_string)
-            .collect::<Vec<_>>()
-            .join(",")
+        frames_arg(&self.frames)
     }
+}
+
+/// A raw software-3D snapshot request. Each file contains the native
+/// colour, depth and polygon-attribute planes before 2D composition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GxShotRequest {
+    /// Frames to capture. Duplicates are harmless.
+    pub frames: Vec<u32>,
+    /// Output directory; created (with parents) before the run.
+    pub dir: PathBuf,
+}
+
+impl GxShotRequest {
+    /// The raw snapshot path for `frame` under `dir`.
+    #[must_use]
+    pub fn path(&self, frame: u32) -> PathBuf {
+        self.dir.join(format!("frame_{frame:06}_gx3d.bin"))
+    }
+
+    /// The oracle's sorted, deduplicated `--gx-shots` value.
+    #[must_use]
+    pub fn frames_arg(&self) -> String {
+        frames_arg(&self.frames)
+    }
+}
+
+/// One native 256×192 software-renderer snapshot from the oracle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Gx3dSnapshot {
+    width: u32,
+    height: u32,
+    color: Box<[u32]>,
+    depth: Box<[u32]>,
+    attributes: Box<[u32]>,
+}
+
+/// Exact per-plane difference counts between two raw GX snapshots.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Gx3dDiff {
+    /// Pixels whose native R6/G6/B6/A5 word differs.
+    pub color_pixels: usize,
+    /// Pixels whose depth word differs.
+    pub depth_pixels: usize,
+    /// Pixels whose edge/fog/polygon metadata differs.
+    pub attribute_pixels: usize,
+    /// Pixels where one image is clear and the other is covered.
+    pub coverage_pixels: usize,
+}
+
+impl Gx3dDiff {
+    /// Whether all three native planes are byte-for-byte equivalent.
+    #[must_use]
+    pub const fn is_exact(self) -> bool {
+        self.color_pixels == 0 && self.depth_pixels == 0 && self.attribute_pixels == 0
+    }
+}
+
+impl Gx3dSnapshot {
+    /// Parses an `APGX3D1` little-endian snapshot.
+    ///
+    /// # Errors
+    /// Returns a gate error when the magic, dimensions, or payload size
+    /// is invalid.
+    pub fn parse(bytes: &[u8]) -> Result<Self, HarnessError> {
+        const HEADER: usize = 16;
+        if bytes.get(..8) != Some(b"APGX3D1\0") {
+            return Err(HarnessError::Gate {
+                what: "raw GX snapshot has invalid magic".to_string(),
+            });
+        }
+        if bytes.len() < HEADER {
+            return Err(HarnessError::Gate {
+                what: "raw GX snapshot is truncated".to_string(),
+            });
+        }
+        let read = |offset: usize| {
+            u32::from_le_bytes(bytes[offset..offset + 4].try_into().expect("four bytes"))
+        };
+        let width = read(8);
+        let height = read(12);
+        if width == 0 || height == 0 {
+            return Err(HarnessError::Gate {
+                what: "raw GX snapshot dimensions must be nonzero".to_string(),
+            });
+        }
+        let pixels = usize::try_from(u64::from(width) * u64::from(height)).map_err(|_| {
+            HarnessError::Gate {
+                what: "raw GX snapshot dimensions overflow".to_string(),
+            }
+        })?;
+        let expected = HEADER
+            .checked_add(pixels.checked_mul(12).ok_or_else(|| HarnessError::Gate {
+                what: "raw GX snapshot payload overflows".to_string(),
+            })?)
+            .ok_or_else(|| HarnessError::Gate {
+                what: "raw GX snapshot size overflows".to_string(),
+            })?;
+        if bytes.len() != expected {
+            return Err(HarnessError::Gate {
+                what: format!(
+                    "raw GX snapshot is {} bytes; expected {expected} for {width}x{height}",
+                    bytes.len()
+                ),
+            });
+        }
+
+        let mut color = Vec::with_capacity(pixels);
+        let mut depth = Vec::with_capacity(pixels);
+        let mut attributes = Vec::with_capacity(pixels);
+        for pixel in bytes[HEADER..].chunks_exact(12) {
+            color.push(u32::from_le_bytes(
+                pixel[0..4].try_into().expect("four bytes"),
+            ));
+            depth.push(u32::from_le_bytes(
+                pixel[4..8].try_into().expect("four bytes"),
+            ));
+            attributes.push(u32::from_le_bytes(
+                pixel[8..12].try_into().expect("four bytes"),
+            ));
+        }
+        Ok(Self {
+            width,
+            height,
+            color: color.into_boxed_slice(),
+            depth: depth.into_boxed_slice(),
+            attributes: attributes.into_boxed_slice(),
+        })
+    }
+
+    /// Loads and parses a snapshot file.
+    ///
+    /// # Errors
+    /// Returns a gate error when the file cannot be read or parsed.
+    pub fn read(path: &Path) -> Result<Self, HarnessError> {
+        let bytes = std::fs::read(path).map_err(|error| HarnessError::Gate {
+            what: format!("cannot read {}: {error}", path.display()),
+        })?;
+        Self::parse(&bytes)
+    }
+
+    /// Snapshot width in pixels.
+    #[must_use]
+    pub const fn width(&self) -> u32 {
+        self.width
+    }
+
+    /// Snapshot height in pixels.
+    #[must_use]
+    pub const fn height(&self) -> u32 {
+        self.height
+    }
+
+    /// Native packed software-renderer colour words.
+    #[must_use]
+    pub fn colors(&self) -> &[u32] {
+        &self.color
+    }
+
+    /// Native depth words used by depth tests.
+    #[must_use]
+    pub fn depths(&self) -> &[u32] {
+        &self.depth
+    }
+
+    /// Native attribute words containing edge, fog, and polygon metadata.
+    #[must_use]
+    pub fn attributes(&self) -> &[u32] {
+        &self.attributes
+    }
+
+    /// Returns the exact colour-change mask between two frames.
+    ///
+    /// # Errors
+    /// Returns a gate error when the dimensions differ.
+    pub fn color_change_mask(&self, next: &Self) -> Result<Vec<bool>, HarnessError> {
+        if (self.width, self.height) != (next.width, next.height) {
+            return Err(HarnessError::Gate {
+                what: format!(
+                    "GX snapshot dimensions differ: {}x{} versus {}x{}",
+                    self.width, self.height, next.width, next.height
+                ),
+            });
+        }
+        Ok(self
+            .color
+            .iter()
+            .zip(next.color.iter())
+            .map(|(before, after)| before != after)
+            .collect())
+    }
+
+    /// Counts exact native-plane differences against `other`.
+    ///
+    /// # Errors
+    /// Returns a gate error when the dimensions differ.
+    pub fn diff(&self, other: &Self) -> Result<Gx3dDiff, HarnessError> {
+        if (self.width, self.height) != (other.width, other.height) {
+            return Err(HarnessError::Gate {
+                what: format!(
+                    "GX snapshot dimensions differ: {}x{} versus {}x{}",
+                    self.width, self.height, other.width, other.height
+                ),
+            });
+        }
+        let mut diff = Gx3dDiff::default();
+        for index in 0..self.color.len() {
+            let color = self.color[index];
+            let depth = self.depth[index];
+            let attribute = self.attributes[index];
+            let other_color = other.color[index];
+            let other_depth = other.depth[index];
+            let other_attribute = other.attributes[index];
+            diff.color_pixels += usize::from(color != other_color);
+            diff.depth_pixels += usize::from(depth != other_depth);
+            diff.attribute_pixels += usize::from(attribute != other_attribute);
+            let covered = color >> 24 != 0;
+            let other_covered = other_color >> 24 != 0;
+            diff.coverage_pixels += usize::from(covered != other_covered);
+        }
+        Ok(diff)
+    }
+}
+
+fn frames_arg(frames: &[u32]) -> String {
+    let mut frames = frames.to_vec();
+    frames.sort_unstable();
+    frames.dedup();
+    frames
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// Parses a frame list as the `apricorn-replay --shots` flag takes it:
@@ -276,7 +500,7 @@ impl OracleRun<'_> {
     /// exits nonzero (its stderr is included), or writes a malformed
     /// trace ([`HarnessError::Syntax`]).
     pub fn run(&self) -> Result<Trace, HarnessError> {
-        self.run_impl(None)
+        self.run_impl(None, None)
     }
 
     /// Like [`run`](Self::run), also writing the screenshots `shots`
@@ -287,10 +511,37 @@ impl OracleRun<'_> {
     /// As [`run`](Self::run), plus a [`HarnessError::Gate`] when the
     /// shots directory cannot be created.
     pub fn run_with_shots(&self, shots: &ShotRequest) -> Result<Trace, HarnessError> {
-        self.run_impl(Some(shots))
+        self.run_impl(Some(shots), None)
     }
 
-    fn run_impl(&self, shots: Option<&ShotRequest>) -> Result<Trace, HarnessError> {
+    /// Like [`run`](Self::run), also writing raw software-3D snapshots.
+    ///
+    /// # Errors
+    /// As [`run`](Self::run), plus a [`HarnessError::Gate`] when the
+    /// snapshot directory cannot be created.
+    pub fn run_with_gx_shots(&self, shots: &GxShotRequest) -> Result<Trace, HarnessError> {
+        self.run_impl(None, Some(shots))
+    }
+
+    /// Runs while writing both composited LCD screenshots and raw 3D
+    /// snapshots.
+    ///
+    /// # Errors
+    /// As [`run`](Self::run), plus a [`HarnessError::Gate`] when an
+    /// artifact directory cannot be created.
+    pub fn run_with_artifacts(
+        &self,
+        shots: &ShotRequest,
+        gx_shots: &GxShotRequest,
+    ) -> Result<Trace, HarnessError> {
+        self.run_impl(Some(shots), Some(gx_shots))
+    }
+
+    fn run_impl(
+        &self,
+        shots: Option<&ShotRequest>,
+        gx_shots: Option<&GxShotRequest>,
+    ) -> Result<Trace, HarnessError> {
         let Some(binary) = find_binary() else {
             return Err(HarnessError::Gate {
                 what: "oracle binary not built (run oracle/setup.ps1)".to_string(),
@@ -381,6 +632,18 @@ impl OracleRun<'_> {
             cmd.arg("--shots")
                 .arg(shots.frames_arg())
                 .arg("--shots-dir")
+                .arg(&shots.dir);
+        }
+        if let Some(shots) = gx_shots.filter(|s| !s.frames.is_empty()) {
+            if let Err(e) = std::fs::create_dir_all(&shots.dir) {
+                cleanup(&dir);
+                return Err(HarnessError::Gate {
+                    what: format!("cannot create {}: {e}", shots.dir.display()),
+                });
+            }
+            cmd.arg("--gx-shots")
+                .arg(shots.frames_arg())
+                .arg("--gx-shots-dir")
                 .arg(&shots.dir);
         }
 
@@ -508,6 +771,70 @@ mod tests {
         assert_eq!(
             shots.bottom_path(300),
             PathBuf::from("shots").join("frame_000300_bottom.png")
+        );
+    }
+
+    #[test]
+    fn gx_snapshot_round_trips_planes_and_change_mask() {
+        let snapshot = |colors: [u32; 2]| {
+            let mut bytes = b"APGX3D1\0".to_vec();
+            bytes.extend_from_slice(&2u32.to_le_bytes());
+            bytes.extend_from_slice(&1u32.to_le_bytes());
+            for (index, color) in colors.into_iter().enumerate() {
+                bytes.extend_from_slice(&color.to_le_bytes());
+                bytes.extend_from_slice(&(0x100 + index as u32).to_le_bytes());
+                bytes.extend_from_slice(&(0x200 + index as u32).to_le_bytes());
+            }
+            Gx3dSnapshot::parse(&bytes).unwrap()
+        };
+        let first = snapshot([10, 20]);
+        let second = snapshot([10, 21]);
+        assert_eq!((first.width(), first.height()), (2, 1));
+        assert_eq!(first.colors(), &[10, 20]);
+        assert_eq!(first.depths(), &[0x100, 0x101]);
+        assert_eq!(first.attributes(), &[0x200, 0x201]);
+        assert_eq!(first.color_change_mask(&second).unwrap(), [false, true]);
+        assert_eq!(
+            first.diff(&second).unwrap(),
+            Gx3dDiff {
+                color_pixels: 1,
+                depth_pixels: 0,
+                attribute_pixels: 0,
+                coverage_pixels: 0,
+            }
+        );
+        assert!(!first.diff(&snapshot([10, 0x0100_0015])).unwrap().is_exact());
+        assert_eq!(
+            first
+                .diff(&snapshot([10, 0x0100_0015]))
+                .unwrap()
+                .coverage_pixels,
+            1
+        );
+    }
+
+    #[test]
+    fn gx_snapshot_rejects_bad_size() {
+        let mut bytes = b"APGX3D1\0".to_vec();
+        bytes.extend_from_slice(&256u32.to_le_bytes());
+        bytes.extend_from_slice(&192u32.to_le_bytes());
+        assert!(Gx3dSnapshot::parse(&bytes).is_err());
+        let mut empty = b"APGX3D1\0".to_vec();
+        empty.extend_from_slice(&0u32.to_le_bytes());
+        empty.extend_from_slice(&192u32.to_le_bytes());
+        assert!(Gx3dSnapshot::parse(&empty).is_err());
+    }
+
+    #[test]
+    fn gx_shot_request_names_files_and_sorts_the_flag() {
+        let shots = GxShotRequest {
+            frames: vec![9, 7, 9, 8],
+            dir: PathBuf::from("gx"),
+        };
+        assert_eq!(shots.frames_arg(), "7,8,9");
+        assert_eq!(
+            shots.path(8),
+            PathBuf::from("gx").join("frame_000008_gx3d.bin")
         );
     }
 

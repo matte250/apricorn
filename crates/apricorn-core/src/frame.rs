@@ -594,6 +594,9 @@ pub struct FieldFrame {
     /// position vector (`Camera_SetFixedTarget`), before the preset's
     /// look-at offset.
     pub camera_target: [i32; 3],
+    /// The area-light registers active for this tick. Static preview
+    /// frames omit them; the live field always supplies the ROM table.
+    pub lighting: Option<crate::field::lighting::ModelLighting>,
     /// The visible map objects, in draw order.
     pub objects: Vec<ObjectView>,
 }
@@ -632,6 +635,7 @@ impl FieldFrame {
             scene,
             camera,
             camera_target: target,
+            lighting: None,
             objects: vec![ObjectView {
                 texture: player,
                 rect: (0, 0, size.0, size.1),

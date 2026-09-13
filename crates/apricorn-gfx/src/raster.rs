@@ -201,11 +201,12 @@ fn render_engine<S: AssetSource + ?Sized>(engine: &EngineFrame, store: &S) -> Sc
     // The 3D core's output stands in for BG0's tilemap while a field
     // is bound (GX_BG0_AS_3D, fieldmap.c:514); the plane's alpha is 0
     // where no polygon covered the pixel (the clear colour's alpha).
-    let field = engine.field.as_ref().map(|view| {
-        let mut pixels = vec![[0u8; 4]; ScreenBuffer::WIDTH * ScreenBuffer::HEIGHT];
-        let mut depth = vec![f64::INFINITY; ScreenBuffer::WIDTH * ScreenBuffer::HEIGHT];
-        crate::field::render(view, &mut pixels, &mut depth);
-        pixels
+    let field = engine.field.as_ref().map(|field| {
+        let view = crate::field::scene_view(field);
+        let mut buffer = crate::gx3d::Gx3dBuffer::new();
+        let registers = crate::field::field_registers(&view);
+        crate::field::render_view_gx(&view, &registers, &mut buffer);
+        buffer.colors().to_vec()
     });
 
     let mut out = ScreenBuffer::new();

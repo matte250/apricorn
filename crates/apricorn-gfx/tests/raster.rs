@@ -1457,14 +1457,26 @@ fn dialogue_fill_border_arrow_and_focus_extents_follow_pret() {
         for x in 16..56 {
             assert_eq!(v(&plain, x, y), 47, "({x}, {y}): the fill, bank 2");
         }
-        assert_eq!(v(&plain, 56, y), border(9), "row {y}: column +9 starts at the fill's edge");
+        assert_eq!(
+            v(&plain, 56, y),
+            border(9),
+            "row {y}: column +9 starts at the fill's edge"
+        );
         assert_eq!(v(&plain, 64, y), border(10), "row {y}: column +10");
         assert_eq!(v(&plain, 72, y), border(11), "row {y}: column +11");
-        assert_eq!(v(&plain, 80, y), 0, "row {y}: nothing past the third column");
+        assert_eq!(
+            v(&plain, 80, y),
+            0,
+            "row {y}: nothing past the third column"
+        );
     }
     for (x, column) in [(0, 0), (8, 1), (16, 2), (48, 2), (56, 3), (64, 4), (72, 5)] {
         assert_eq!(v(&plain, x, 8), border(column), "top row column {column}");
-        assert_eq!(v(&plain, x, 48), border(12 + column), "bottom row column {column}");
+        assert_eq!(
+            v(&plain, x, 48),
+            border(12 + column),
+            "bottom row column {column}"
+        );
     }
 
     // The arrow block: tiles (8..10, 4..6) → pixels (64..80, 32..48).
@@ -1476,7 +1488,10 @@ fn dialogue_fill_border_arrow_and_focus_extents_follow_pret() {
         });
         let [main, _] = render(&frame, &store);
         let offset = ARROW_TILE_OFFSETS[usize::from(index)];
-        for (pos, (x, y)) in [(64, 32), (72, 32), (64, 40), (72, 40)].into_iter().enumerate() {
+        for (pos, (x, y)) in [(64, 32), (72, 32), (64, 40), (72, 40)]
+            .into_iter()
+            .enumerate()
+        {
             assert_eq!(
                 v(&main, x, y),
                 border(18 + offset * 4 + pos as u8),
@@ -1485,8 +1500,16 @@ fn dialogue_fill_border_arrow_and_focus_extents_follow_pret() {
         }
         // Only those four tiles change: the column above the block
         // and the +9 column beside it are still border.
-        assert_eq!(v(&main, 64, 24), border(10), "index {index}: +10 above the block");
-        assert_eq!(v(&main, 56, 40), border(9), "index {index}: +9 beside the block");
+        assert_eq!(
+            v(&main, 64, 24),
+            border(10),
+            "index {index}: +10 above the block"
+        );
+        assert_eq!(
+            v(&main, 56, 40),
+            border(9),
+            "index {index}: +9 beside the block"
+        );
         assert_eq!(v(&main, 80, 40), 0, "index {index}: nothing past the block");
         renders.push(main);
     }
@@ -1509,9 +1532,20 @@ fn dialogue_fill_border_arrow_and_focus_extents_follow_pret() {
     let focus_tile = |t: u8| 32 + (t % 15 + 1); // bank 2
     assert_eq!(v(&main, 31, 16), 47, "left of the icon: the fill");
     assert_eq!(v(&main, 32, 16), focus_tile(12), "frame 1's tile 0");
-    assert_eq!(v(&main, 55, 47), focus_tile(23), "frame 1's tile 11 ends at the fill's edge");
-    assert_eq!(v(&main, 56, 16), border(9), "the border past the icon is untouched");
-    for (pos, (x, y)) in [(64, 32), (72, 32), (64, 40), (72, 40)].into_iter().enumerate() {
+    assert_eq!(
+        v(&main, 55, 47),
+        focus_tile(23),
+        "frame 1's tile 11 ends at the fill's edge"
+    );
+    assert_eq!(
+        v(&main, 56, 16),
+        border(9),
+        "the border past the icon is untouched"
+    );
+    for (pos, (x, y)) in [(64, 32), (72, 32), (64, 40), (72, 40)]
+        .into_iter()
+        .enumerate()
+    {
         assert_eq!(
             v(&main, x, y),
             border(18 + ARROW_TILE_OFFSETS[3] * 4 + pos as u8),
@@ -1580,26 +1614,40 @@ mod field_compositing {
         let h = half * 4096;
         let corner = |dx: i32, dz: i32| Vertex {
             position: [centre[0] + dx, 0, centre[2] + dz],
+            gx_position: [centre[0] + dx, 0, centre[2] + dz],
             uv: [0, 0],
             color: 0x7FFF,
+            normal: None,
         };
         let (a, b, c, d) = (corner(-h, -h), corner(h, -h), corner(h, h), corner(-h, h));
         Arc::new(FieldScene::synthetic(
             0,
             vec![Mesh {
-                triangles: vec![[a, b, c], [a, c, d]],
+                gx_transform: apricorn_core::field::model::GxTransform::IDENTITY,
+                primitives: vec![apricorn_core::field::model::Primitive::Quad([a, b, c, d])],
                 texture: Some(Arc::new(Texture {
                     width: 1,
                     height: 1,
                     pixels: vec![[255, 0, 0, 255]],
+                    format: apricorn_core::formats::TexFmt::Pltt256,
+                    color0_transparent: false,
+                    raw: None,
                 })),
                 texture_flags: 0,
                 alpha,
+                // These fixtures exercise 2D composition, not face culling.
+                // A zero face mask correctly hides a nondegenerate GX quad.
+                polygon_attr: (u32::from(alpha) << 16) | (3 << 6),
+                diffuse_ambient: 0x7FFF,
+                specular_emission: 0,
             }],
             Texture {
                 width: 1,
                 height: 1,
                 pixels: vec![[0, 0, 0, 0]],
+                format: apricorn_core::formats::TexFmt::Pltt256,
+                color0_transparent: true,
+                raw: None,
             },
             [0, 0],
             bedroom_camera(),

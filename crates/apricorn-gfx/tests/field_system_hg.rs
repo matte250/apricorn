@@ -18,15 +18,8 @@ const ROM_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../hg_usa.nds");
 /// faded-in tick after the stairs, New Bark Town at the first fully
 /// faded-in tick after the front door.
 ///
-/// Re-pinned with the BDHC height solver (`field::height`): the player
-/// and the camera target sit on the land surface, so New Bark Town's
-/// frame moved down by the 16-unit ground height (the mailbox's top
-/// row 50 → 62, the oracle's 62; the player's outline rows 52-90, the
-/// cap alone, → 64-98, the whole body, the oracle's 62-98 at frame
-/// 7372) and 1F's faintly tilted floor (0.03 units) re-rasterized the
-/// billboard's edges without moving a landmark (outline rows 30-97
-/// before and after, the oracle's 30-99). The bedroom's plate is at 0
-/// and its hash is unchanged.
+/// Preserve main's historical goldens until replacement frames pass the
+/// exact oracle gate. The renderer-parity draft intentionally fails these.
 const BEDROOM_MID_STEP: &str = "0867fcf6cf096f3b1aae90cf6b8ad00e9851a213";
 const HOUSE_1F_ARRIVAL: &str = "99fe2418595825c63b2e6ed2ac774fd67fb69622";
 const NEW_BARK_ARRIVAL: &str = "702d762517b6563eab476d612fc48ac2bd327982";
@@ -79,6 +72,74 @@ fn render(field: &FieldSystem, store: &AssetStore, name: &str) -> String {
     sha1(pixels)
 }
 
+fn write_raw_field(field: &FieldSystem, name: &str) {
+    let Some(field_frame) = field.frame().main.field.as_ref() else {
+        return;
+    };
+    let view = apricorn_gfx::field::scene_view(field_frame);
+    let mut buffer = apricorn_gfx::Gx3dBuffer::new();
+    let registers = apricorn_gfx::field::field_registers(&view);
+    apricorn_gfx::field::render_view_gx(&view, &registers, &mut buffer);
+    write_gx_snapshot(name.trim_end_matches(".png"), &buffer);
+    let uncovered: Vec<_> = buffer
+        .colors()
+        .iter()
+        .enumerate()
+        .filter_map(|(index, pixel)| (pixel[3] == 0).then_some((index % 256, index / 256)))
+        .collect();
+    if std::env::var("APRICORN_RENDER_OUT").is_ok() {
+        let pixels: Vec<[u8; 4]> = buffer
+            .colors()
+            .iter()
+            .map(|&pixel| {
+                if pixel[3] == 0 {
+                    [255, 0, 255, 255]
+                } else {
+                    pixel
+                }
+            })
+            .collect();
+        write_png(name, &pixels);
+    }
+    assert!(
+        uncovered.is_empty(),
+        "New Bark 3D plane exposed clear-pixel cracks at {uncovered:?}"
+    );
+}
+
+fn write_gx_snapshot(name: &str, buffer: &apricorn_gfx::Gx3dBuffer) {
+    let Ok(dir) = std::env::var("APRICORN_RENDER_OUT") else {
+        return;
+    };
+    let colors = buffer.native_colors();
+    let attributes = buffer.native_attributes();
+    let mut bytes = Vec::with_capacity(16 + colors.len() * 12);
+    bytes.extend_from_slice(b"APGX3D1\0");
+    bytes.extend_from_slice(&256u32.to_le_bytes());
+    bytes.extend_from_slice(&192u32.to_le_bytes());
+    for ((color, depth), attribute) in colors
+        .into_iter()
+        .zip(buffer.depths().iter().copied())
+        .zip(attributes)
+    {
+        bytes.extend_from_slice(&color.to_le_bytes());
+        bytes.extend_from_slice(&depth.to_le_bytes());
+        bytes.extend_from_slice(&attribute.to_le_bytes());
+    }
+    std::fs::write(Path::new(&dir).join(format!("{name}.gx3d.bin")), bytes).unwrap();
+}
+
+fn write_field_snapshot(field: &FieldSystem, name: &str) {
+    let Some(field_frame) = field.frame().main.field.as_ref() else {
+        return;
+    };
+    let view = apricorn_gfx::field::scene_view(field_frame);
+    let mut buffer = apricorn_gfx::Gx3dBuffer::new();
+    let registers = apricorn_gfx::field::field_registers(&view);
+    apricorn_gfx::field::render_view_gx(&view, &registers, &mut buffer);
+    write_gx_snapshot(name, &buffer);
+}
+
 fn run_until_running(field: &mut FieldSystem, store: &AssetStore) {
     while field.phase() != FieldPhase::Running {
         field.tick(Input::default(), store);
@@ -90,7 +151,7 @@ fn bedroom_mid_step_golden() {
     let Some(store) = open_rom() else {
         return;
     };
-    let mut field = FieldSystem::new_game(&store, 0).unwrap();
+    let mut field = FieldSystem::new_game_at(&store, 0, 9 * 60 * 60).unwrap();
     run_until_running(&mut field, &store);
     // Four ticks of DOWN: the position vector half a tile south; the
     // frame shows the previous tick's position (three steps) and the
@@ -103,6 +164,38 @@ fn bedroom_mid_step_golden() {
 }
 
 #[test]
+fn bedroom_walk_has_a_pinned_contiguous_raster_sequence() {
+    let Some(store) = open_rom() else {
+        return;
+    };
+    let mut field = FieldSystem::new_game_at(&store, 0, 9 * 60 * 60).unwrap();
+    run_until_running(&mut field, &store);
+    let mut actual = Vec::new();
+    actual.push(render(&field, &store, "field-motion-00"));
+    write_field_snapshot(&field, "field-motion-00");
+    for frame in 1..=9 {
+        field.tick(held(key::DOWN), &store);
+        actual.push(render(&field, &store, &format!("field-motion-{frame:02}")));
+        write_field_snapshot(&field, &format!("field-motion-{frame:02}"));
+    }
+    // Historical diagnostic sequence from the earlier local raster pass,
+    // not an oracle-approved golden and not used to claim DS equivalence.
+    let expected = [
+        "41c3f0a5c362040dad0aece4a4aef6b48d58c99c",
+        "41c3f0a5c362040dad0aece4a4aef6b48d58c99c",
+        "91fc0d41a7f3eaf7ef1551891bf37ef10f013583",
+        "0218152a3d5a6643fcd656efc7ba7c213c42d5d0",
+        "ccb8b7d812a736b38cd1f4d653ff019fa68e6359",
+        "c413709d06b17a8fe3b521365753a4004e94c460",
+        "7f9733568fcaa71c971c6216421f0af10fb2f073",
+        "5d392fca5c110792bb29e1b9bb06fd49ea23ccf1",
+        "528e2e3ae71764eee5addf9aff00fa346085f8e0",
+        "ed658a77d642b3781f39f931d262908cea8f01ba",
+    ];
+    assert_eq!(actual, expected, "the complete step must stay frame-exact");
+}
+
+#[test]
 fn house_1f_arrival_golden() {
     let Some(store) = open_rom() else {
         return;
@@ -110,7 +203,7 @@ fn house_1f_arrival_golden() {
     // The stairs' arrival: one tile into the wall west of 1F's stairs,
     // walking out — ticked through the transition's fade-in to the
     // first fully bright frame.
-    let mut field = FieldSystem::new_game(&store, 0).unwrap();
+    let mut field = FieldSystem::new_game_at(&store, 0, 9 * 60 * 60).unwrap();
     run_until_running(&mut field, &store);
     for _ in 0..27 {
         field.tick(held(key::LEFT), &store);
@@ -143,8 +236,13 @@ fn new_bark_arrival_golden() {
     let Some(store) = open_rom() else {
         return;
     };
-    let mut field = FieldSystem::enter(&store, Location::new(63, 1, 0, 0, Direction::East), 0)
-        .unwrap();
+    let mut field = FieldSystem::enter_at(
+        &store,
+        Location::new(63, 1, 0, 0, Direction::East),
+        0,
+        9 * 60 * 60,
+    )
+    .unwrap();
     run_until_running(&mut field, &store);
     for _ in 0..60 {
         field.tick(held(key::DOWN), &store);
@@ -165,9 +263,98 @@ fn new_bark_arrival_golden() {
         field.tick(Input::default(), &store);
     }
     render(&field, &store, "field-system-new-bark-standing");
+    write_raw_field(&field, "field-system-new-bark-standing-raw.png");
     for _ in 0..30 {
         field.tick(held(key::RIGHT), &store);
     }
     render(&field, &store, "field-system-new-bark-east");
-    assert_eq!(hash, NEW_BARK_ARRIVAL, "New Bark Town arrival engine A hash");
+    write_raw_field(&field, "field-system-new-bark-east-raw.png");
+    field.tick(Input::default(), &store);
+    for _ in 0..120 {
+        field.tick(held(key::LEFT), &store);
+    }
+    render(&field, &store, "field-system-new-bark-west");
+    write_raw_field(&field, "field-system-new-bark-west-raw.png");
+    assert_eq!(
+        hash, NEW_BARK_ARRIVAL,
+        "New Bark Town arrival engine A hash"
+    );
+}
+
+/// Review sequence, not an oracle-approved golden. Keep every sub-tile
+/// camera position so furniture-edge and colour changes can be inspected.
+#[test]
+fn house_furniture_contiguous_review_sequence() {
+    let Some(store) = open_rom() else {
+        return;
+    };
+    let mut field = FieldSystem::enter_at(
+        &store,
+        Location::new(63, -1, 5, 6, Direction::North),
+        0,
+        9 * 60 * 60,
+    )
+    .unwrap();
+    run_until_running(&mut field, &store);
+    let mut targets = std::collections::BTreeSet::new();
+    for frame in 0..24 {
+        let name = format!("field-house-furniture-{frame:02}");
+        let first = render(&field, &store, &name);
+        let [second, _] = apricorn_gfx::render(field.frame(), &store);
+        assert_eq!(
+            first,
+            sha1(second.as_rgba()),
+            "same frame must render identically"
+        );
+        write_field_snapshot(&field, &name);
+        targets.insert(field.frame().main.field.as_ref().unwrap().camera_target);
+        assert_eq!(field.scene().map_id, 63);
+        field.tick(held(if frame < 12 { key::UP } else { key::DOWN }), &store);
+    }
+    assert!(
+        targets.len() >= 8,
+        "review must actually move the camera, not capture one pose repeatedly"
+    );
+}
+
+/// Run explicitly with --release --ignored; asset loading and simulation
+/// are outside the timed region. No snapshots or disk I/O are timed.
+#[test]
+#[ignore = "release-only New Bark CPU raster benchmark"]
+fn new_bark_release_frame_budget() {
+    assert!(!cfg!(debug_assertions), "run this benchmark with --release");
+    let Some(store) = open_rom() else {
+        return;
+    };
+    let mut field = FieldSystem::enter_at(
+        &store,
+        Location::new(60, -1, 695, 397, Direction::West),
+        0,
+        9 * 60 * 60,
+    )
+    .unwrap();
+    run_until_running(&mut field, &store);
+    let mut buffer = apricorn_gfx::Gx3dBuffer::new();
+    let mut samples = Vec::new();
+    for tick in 0..144 {
+        field.tick(held(if tick < 72 { key::LEFT } else { key::RIGHT }), &store);
+        let view = apricorn_gfx::field::scene_view(field.frame().main.field.as_ref().unwrap());
+        let registers = apricorn_gfx::field::field_registers(&view);
+        let start = std::time::Instant::now();
+        apricorn_gfx::field::render_view_gx(std::hint::black_box(&view), &registers, &mut buffer);
+        let elapsed = start.elapsed();
+        std::hint::black_box(buffer.colors());
+        if tick >= 24 {
+            samples.push(elapsed.as_secs_f64() * 1000.0);
+        }
+    }
+    samples.sort_by(f64::total_cmp);
+    let mean = samples.iter().sum::<f64>() / samples.len() as f64;
+    let p95 = samples[samples.len() * 95 / 100];
+    let max = samples[samples.len() - 1];
+    eprintln!(
+        "New Bark raw 3D: mean={mean:.3}ms p95={p95:.3}ms max={max:.3}ms frames={}",
+        samples.len()
+    );
+    assert!(max < 16.714, "3D exceeded native frame budget: {max:.3}ms");
 }

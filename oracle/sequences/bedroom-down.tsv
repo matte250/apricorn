@@ -1,0 +1,12 @@
+# Oracle paths and engine paths; tab-separated, relative to this manifest.
+# Engine frames 0/1 repeat the standing pose; retail advances movement every second VBlank.
+../../out/oracle-gx-motion-down/frame_004822_gx3d.bin	../../out/ds-render-review/field-motion-00.gx3d.bin
+../../out/oracle-gx-motion-down/frame_004822_gx3d.bin	../../out/ds-render-review/field-motion-01.gx3d.bin
+../../out/oracle-gx-motion-down/frame_004823_gx3d.bin	../../out/ds-render-review/field-motion-02.gx3d.bin
+../../out/oracle-gx-motion-down/frame_004825_gx3d.bin	../../out/ds-render-review/field-motion-03.gx3d.bin
+../../out/oracle-gx-motion-down/frame_004827_gx3d.bin	../../out/ds-render-review/field-motion-04.gx3d.bin
+../../out/oracle-gx-motion-down/frame_004829_gx3d.bin	../../out/ds-render-review/field-motion-05.gx3d.bin
+../../out/oracle-gx-motion-down/frame_004831_gx3d.bin	../../out/ds-render-review/field-motion-06.gx3d.bin
+../../out/oracle-gx-motion-down/frame_004833_gx3d.bin	../../out/ds-render-review/field-motion-07.gx3d.bin
+../../out/oracle-gx-motion-down/frame_004835_gx3d.bin	../../out/ds-render-review/field-motion-08.gx3d.bin
+../../out/oracle-gx-motion-down/frame_004837_gx3d.bin	../../out/ds-render-review/field-motion-09.gx3d.bin

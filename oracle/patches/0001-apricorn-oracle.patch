@@ -17,12 +17,30 @@ index e85dd42..2a6bb79 100644
 +if(WIN32)
 +    target_link_options(apricorn-oracle PRIVATE -static -static-libgcc -static-libstdc++)
 +endif()
+diff --git a/src/GPU3D_Soft.h b/src/GPU3D_Soft.h
+--- a/src/GPU3D_Soft.h
++++ b/src/GPU3D_Soft.h
+@@ -40,3 +40,14 @@ public:
+     void RenderFrame(GPU& gpu) override;
+     void RestartFrame(GPU& gpu) override;
+     u32* GetLine(int line) override;
++
++    // apricorn oracle: expose the topmost raw depth and attribute planes.
++    // These accessors live only in the headless reference build.
++    [[nodiscard]] u32 GetDepthPixel(u32 x, u32 y) const noexcept
++    {
++        return DepthBuffer[FirstPixelOffset + y * ScanlineWidth + x];
++    }
++    [[nodiscard]] u32 GetAttrPixel(u32 x, u32 y) const noexcept
++    {
++        return AttrBuffer[FirstPixelOffset + y * ScanlineWidth + x];
++    }
 diff --git a/src/apricorn-oracle.cpp b/src/apricorn-oracle.cpp
 new file mode 100644
 index 0000000..69b55b3
 --- /dev/null
 +++ b/src/apricorn-oracle.cpp
-@@ -0,0 +1,704 @@
+@@ -0,0 +1,824 @@
 +/*
 +    apricorn-oracle — the headless melonDS that produces apricorn traces.
 +
@@ -55,6 +73,7 @@ index 0000000..69b55b3
 +                         --input-sha1 HEX --regions-sha1 HEX
 +                         [--producer oracle-melonds-1.1]
 +                         [--shots F,F,... --shots-dir DIR]
++                         [--gx-shots F,F,... --gx-shots-dir DIR]
 +*/
 +
 +#include <algorithm>
@@ -76,6 +95,7 @@ index 0000000..69b55b3
 +
 +#include "NDS.h"
 +#include "NDSCart.h"
++#include "GPU3D_Soft.h"
 +#include "sha1/sha1.hpp" // extern "C" wrapper — sha1.c is compiled as C
 +
 +// melonDS's fixed-width aliases are namespaced; the oracle uses them
@@ -234,6 +254,14 @@ index 0000000..69b55b3
 +    out.push_back(u8(v));
 +}
 +
++void PutLE32(std::vector<u8>& out, u32 v)
++{
++    out.push_back(u8(v));
++    out.push_back(u8(v >> 8));
++    out.push_back(u8(v >> 16));
++    out.push_back(u8(v >> 24));
++}
++
 +// One PNG chunk: big-endian length, 4-byte type, data, CRC-32 over
 +// type + data.
 +void PngChunk(std::vector<u8>& out, const char* type, const std::vector<u8>& data)
@@ -325,6 +353,97 @@ index 0000000..69b55b3
 +    WriteFile(dir + name, EncodeScreenPng(top, stride));
 +    snprintf(name, sizeof(name), "/frame_%06u_bottom.png", frame);
 +    WriteFile(dir + name, EncodeScreenPng(bottom, stride));
++}
++
++// Writes the software 3D core before engine-A/B compositing.  The
++// little-endian APGX3D1 stream contains width/height followed by one
++// `{color, depth, attributes}` u32 triplet per pixel.  `color` is the
++// renderer's native packed 6-bit RGB / 5-bit alpha value; depth and
++// attributes are the exact planes used for depth tests, polygon ids,
++// fog and edge coverage.
++void WriteGxShot(melonDS::NDS& nds, const std::string& dir, u32 frame)
++{
++    auto* soft = dynamic_cast<melonDS::SoftRenderer*>(&nds.GPU.GPU3D.GetCurrentRenderer());
++    if (!soft)
++    {
++        fprintf(stderr, "--gx-shots requires the software 3D renderer\n");
++        exit(2);
++    }
++    std::vector<u8> raw = {'A','P','G','X','3','D','1',0};
++    PutLE32(raw, SCREEN_W);
++    PutLE32(raw, SCREEN_H);
++    raw.reserve(raw.size() + SCREEN_W * SCREEN_H * 12);
++    for (u32 y = 0; y < SCREEN_H; y++)
++    {
++        const u32* color = nds.GPU.GPU3D.GetLine(y);
++        for (u32 x = 0; x < SCREEN_W; x++)
++        {
++            PutLE32(raw, color[x]);
++            PutLE32(raw, soft->GetDepthPixel(x, y));
++            PutLE32(raw, soft->GetAttrPixel(x, y));
++        }
++    }
++    char name[64];
++    snprintf(name, sizeof(name), "/frame_%06u_gx3d.bin", frame);
++    WriteFile(dir + name, raw);
++
++    // Keep a second, renderer-input-side artifact beside the resolved
++    // framebuffer.  This makes camera/matrix, clipping, polygon ordering,
++    // Z/W and interpolation defects distinguishable without copying any
++    // melonDS implementation into apricorn.  Signed fields are written as
++    // their little-endian two's-complement u32 representation.
++    std::vector<u8> geometry = {'A','P','G','X','G','E','O','1'};
++    auto& gx = nds.GPU.GPU3D;
++    PutLE32(geometry, gx.RenderDispCnt);
++    PutLE32(geometry, gx.RenderClearAttr1);
++    PutLE32(geometry, gx.RenderClearAttr2);
++    PutLE32(geometry, gx.FlushAttributes);
++    PutLE32(geometry, gx.RenderNumPolygons);
++    for (u32 i = 0; i < 16; i++) PutLE32(geometry, (u32)gx.ProjMatrix[i]);
++    for (u32 i = 0; i < 16; i++) PutLE32(geometry, (u32)gx.PosMatrix[i]);
++    for (u32 i = 0; i < 16; i++) PutLE32(geometry, (u32)gx.ClipMatrix[i]);
++
++    for (u32 i = 0; i < gx.RenderNumPolygons; i++)
++    {
++        const melonDS::Polygon* polygon = gx.RenderPolygonRAM[i];
++        PutLE32(geometry, polygon->Attr);
++        PutLE32(geometry, polygon->TexParam);
++        PutLE32(geometry, polygon->TexPalette);
++        PutLE32(geometry, polygon->NumVertices);
++        PutLE32(geometry, (u32)polygon->Type);
++        PutLE32(geometry, polygon->SortKey);
++        PutLE32(geometry, polygon->WBuffer ? 1 : 0);
++        u32 flags = (polygon->FacingView ? 1 : 0)
++                  | (polygon->Translucent ? 2 : 0)
++                  | (polygon->IsShadowMask ? 4 : 0)
++                  | (polygon->IsShadow ? 8 : 0)
++                  | (polygon->Degenerate ? 16 : 0);
++        PutLE32(geometry, flags);
++        for (u32 vertex = 0; vertex < polygon->NumVertices; vertex++)
++        {
++            const melonDS::Vertex* v = polygon->Vertices[vertex];
++            for (u32 component = 0; component < 4; component++)
++                PutLE32(geometry, (u32)v->Position[component]);
++            PutLE32(geometry, (u32)v->FinalPosition[0]);
++            PutLE32(geometry, (u32)v->FinalPosition[1]);
++            PutLE32(geometry, polygon->FinalZ[vertex]);
++            PutLE32(geometry, polygon->FinalW[vertex]);
++            for (u32 component = 0; component < 3; component++)
++                PutLE32(geometry, (u32)v->FinalColor[component]);
++            PutLE32(geometry, (u32)(s32)v->TexCoords[0]);
++            PutLE32(geometry, (u32)(s32)v->TexCoords[1]);
++        }
++    }
++    snprintf(name, sizeof(name), "/frame_%06u_gxgeo.bin", frame);
++    WriteFile(dir + name, geometry);
++    std::vector<u8> registers;
++    for (u32 i = 0; i < 8; i++) PutLE32(registers, gx.RenderEdgeTable[i]);
++    for (u32 i = 0; i < 32; i++) PutLE32(registers, gx.RenderToonTable[i]);
++    PutLE32(registers, gx.RenderFogColor);
++    PutLE32(registers, gx.RenderFogOffset);
++    PutLE32(registers, gx.RenderFogShift);
++    snprintf(name, sizeof(name), "/frame_%06u_gxregs.bin", frame);
++    WriteFile(dir + name, registers);
 +}
 +
 +// Creates the shots directory if it is missing (its parent must exist).
@@ -558,6 +677,8 @@ index 0000000..69b55b3
 +    std::string input_sha1, regions_sha1; // passthrough header gates
 +    std::set<u32> shots;                  // frames to screenshot (may be empty)
 +    std::string shots_dir;                // where the PNGs go
++    std::set<u32> gx_shots;               // raw 3D planes to snapshot
++    std::string gx_shots_dir;
 +};
 +
 +std::optional<Args> ParseArgs(int argc, char** argv)
@@ -587,6 +708,8 @@ index 0000000..69b55b3
 +        else if (!strcmp(argv[i], "--regions-sha1")) a.regions_sha1 = next("--regions-sha1");
 +        else if (!strcmp(argv[i], "--shots")) a.shots = ParseFrameList(next("--shots"));
 +        else if (!strcmp(argv[i], "--shots-dir")) a.shots_dir = next("--shots-dir");
++        else if (!strcmp(argv[i], "--gx-shots")) a.gx_shots = ParseFrameList(next("--gx-shots"));
++        else if (!strcmp(argv[i], "--gx-shots-dir")) a.gx_shots_dir = next("--gx-shots-dir");
 +        else { fprintf(stderr, "unknown argument %s\n", argv[i]); exit(64); }
 +    }
 +    if (a.rom.empty() || a.out.empty() || a.regions.empty()
@@ -595,6 +718,11 @@ index 0000000..69b55b3
 +    if (!a.shots.empty() && a.shots_dir.empty())
 +    {
 +        fprintf(stderr, "--shots needs --shots-dir\n");
++        exit(64);
++    }
++    if (!a.gx_shots.empty() && a.gx_shots_dir.empty())
++    {
++        fprintf(stderr, "--gx-shots needs --gx-shots-dir\n");
 +        exit(64);
 +    }
 +    return a;
@@ -612,7 +740,8 @@ index 0000000..69b55b3
 +            "       --regions regions.bin [--input input.bin] [--probes probes.bin]\n"
 +            "       [--frames N] [--rtc 2010-03-01T09:00:00]\n"
 +            "       --input-sha1 HEX --regions-sha1 HEX [--producer NAME]\n"
-+            "       [--shots F,F,... --shots-dir DIR]\n");
++            "       [--shots F,F,... --shots-dir DIR]\n"
++            "       [--gx-shots F,F,... --gx-shots-dir DIR]\n");
 +        return 64;
 +    }
 +    Args a = *opt;
@@ -638,6 +767,13 @@ index 0000000..69b55b3
 +        for (u32 f : a.shots)
 +            if (f >= a.frames)
 +                fprintf(stderr, "warning: --shots frame %u is past --frames %u, never written\n", f, a.frames);
++    }
++    if (!a.gx_shots.empty())
++    {
++        EnsureDir(a.gx_shots_dir);
++        for (u32 f : a.gx_shots)
++            if (f >= a.frames)
++                fprintf(stderr, "warning: --gx-shots frame %u is past --frames %u, never written\n", f, a.frames);
 +    }
 +
 +    // Boot: cart in, reset, pin the RTC, direct boot, go. Defaults all
@@ -709,6 +845,8 @@ index 0000000..69b55b3
 +        // the machine. They never write to `out`.
 +        if (a.shots.count(frame))
 +            WriteShots(*nds, a.shots_dir, frame);
++        if (a.gx_shots.count(frame))
++            WriteGxShot(*nds, a.gx_shots_dir, frame);
 +
 +        for (const Region& r : regions)
 +        {

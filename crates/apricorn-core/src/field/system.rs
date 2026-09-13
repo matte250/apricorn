@@ -43,6 +43,7 @@ use super::avatar::{
 use super::events::WarpEvent;
 use super::height::{HeightMode, scene_height};
 use super::input::{FieldInput, FieldInputContext};
+use super::lighting::{AreaLightArchive, AreaLightManager, ModelLighting, archive_for_light_type};
 use super::map_header::MapHeaders;
 use super::map_object::{
     ATTR_NONE, Collision, Direction, FX32_ONE, MapObject, MovementCmd, TILE_FX32, VecFx32, family,
@@ -387,8 +388,10 @@ impl PlayerSprite {
         for (_, name) in &names {
             frames.push(decode_texture(&btx, name, &palette).map_err(corrupt)?);
         }
-        let (Some(first), true) = (frames.first(), frames.iter().all(|f| f.width == frames[0].width))
-        else {
+        let (Some(first), true) = (
+            frames.first(),
+            frames.iter().all(|f| f.width == frames[0].width),
+        ) else {
             return Err(corrupt(NdsError::Invalid {
                 what: "player texture archive without uniform frames",
             }));
@@ -398,11 +401,30 @@ impl PlayerSprite {
         for f in &frames {
             pixels.extend_from_slice(&f.pixels);
         }
+        let raw = first
+            .raw
+            .as_ref()
+            .map(|first_raw| super::model::RawTexture {
+                texels: frames
+                    .iter()
+                    .flat_map(|frame| {
+                        frame
+                            .raw
+                            .as_ref()
+                            .into_iter()
+                            .flat_map(|raw| raw.texels.iter().copied())
+                    })
+                    .collect(),
+                palette: first_raw.palette.clone(),
+            });
         Ok(Self {
             strip: Arc::new(Texture {
                 width: w,
                 height: h * frames.len(),
                 pixels,
+                format: first.format,
+                color0_transparent: first.color0_transparent,
+                raw,
             }),
             frame_size: (
                 u16::try_from(w).unwrap_or(u16::MAX),
@@ -494,7 +516,9 @@ impl PlayerSprite {
     #[must_use]
     pub fn texture_index(&self) -> u16 {
         let index = (self.frame >> 12) / FRAMES_PER_TEXTURE;
-        u16::try_from(index.max(0)).unwrap_or(0).min(self.frame_count.saturating_sub(1))
+        u16::try_from(index.max(0))
+            .unwrap_or(0)
+            .min(self.frame_count.saturating_sub(1))
     }
 
     /// The billboard for this sprite standing at `position` (the
@@ -780,6 +804,9 @@ pub struct FieldSystem {
     entrance: Location,
     previous: Location,
     camera: CameraPreset,
+    lighting: ModelLighting,
+    area_lights: AreaLightManager,
+    clock_seconds: u32,
     fade: FieldFade,
     phase: FieldPhase,
     task_tick: u32,
@@ -807,6 +834,18 @@ impl FieldSystem {
         Self::enter(store, Location::PLAYER_ROOM, gender)
     }
 
+    /// New-game entry with a deterministic time of day for lighting.
+    ///
+    /// # Errors
+    /// Returns an error if the scene, sprite or light archive cannot load.
+    pub fn new_game_at(
+        store: &AssetStore,
+        gender: u8,
+        seconds_of_day: u32,
+    ) -> Result<Self, AssetsError> {
+        Self::enter_at(store, Location::PLAYER_ROOM, gender, seconds_of_day)
+    }
+
     /// The field entered at `location` — `sub_02052F94` + `sub_02053284`
     /// + `sub_0205316C` (`src/field_warp_tasks.c:197-291`): resolve a warp
     /// id to its tile, load the map around the player, create the
@@ -816,11 +855,30 @@ impl FieldSystem {
     /// Returns an [`AssetsError`] when a map or sprite member fails to
     /// load.
     pub fn enter(store: &AssetStore, location: Location, gender: u8) -> Result<Self, AssetsError> {
+        Self::enter_at(store, location, gender, 9 * 60 * 60)
+    }
+
+    /// Enters a scene with a deterministic time of day for lighting.
+    ///
+    /// # Errors
+    /// Returns an error if the scene, sprite or light archive cannot load.
+    pub fn enter_at(
+        store: &AssetStore,
+        location: Location,
+        gender: u8,
+        seconds_of_day: u32,
+    ) -> Result<Self, AssetsError> {
         let sprite = PlayerSprite::load(store, gender)?;
         let flags = BehaviorFlags::load(store)?;
         let (scene, location) = Self::load_location(store, location, gender)?;
         let avatar = Self::create_avatar(&scene, &flags, &location, gender);
         let camera = scene.camera;
+        let mut lighting = ModelLighting::default();
+        let archive = AreaLightArchive::load(
+            store,
+            archive_for_light_type(scene.area.light_selector, false),
+        )?;
+        let area_lights = AreaLightManager::new(archive, seconds_of_day, &mut lighting);
         let mut system = Self {
             scene: Arc::new(scene),
             flags,
@@ -831,6 +889,9 @@ impl FieldSystem {
             entrance: location,
             previous: location,
             camera,
+            lighting,
+            area_lights,
+            clock_seconds: seconds_of_day % 86_400,
             fade: FieldFade::default(),
             phase: FieldPhase::FadeIn,
             task_tick: 0,
@@ -866,10 +927,8 @@ impl FieldSystem {
                 .get(location.map_id)
                 .ok_or_else(|| AssetsError::Missing(format!("map header {}", location.map_id)))?;
             let events = super::events::MapEvents::load(store, header.events_bank)?;
-            let warp: &WarpEvent = events
-                .warps
-                .get(location.warp_id as usize)
-                .ok_or_else(|| {
+            let warp: &WarpEvent =
+                events.warps.get(location.warp_id as usize).ok_or_else(|| {
                     AssetsError::Missing(format!(
                         "warp {} of map {}",
                         location.warp_id, location.map_id
@@ -1050,9 +1109,9 @@ impl FieldSystem {
 
     /// One game tick (see the module doc for the order).
     pub fn tick(&mut self, input: Input, store: &AssetStore) -> &LogicalFrame {
-        let previous_keys = self
-            .last_input
-            .map_or(Keys::IDLE, |i| i.held_keys);
+        let seconds = (self.clock_seconds + self.ticks / 60) % 86_400;
+        self.area_lights.update(seconds, &mut self.lighting);
+        let previous_keys = self.last_input.map_or(Keys::IDLE, |i| i.held_keys);
         let held = input.keys;
         let new_keys = held.pressed(previous_keys);
 
@@ -1136,8 +1195,11 @@ impl FieldSystem {
                 // clears (begin + 7), when the task unwinds; movement is
                 // allowed from the following tick.
                 if self.task_tick == 0 {
-                    self.fade
-                        .begin(FadeDirection::In, FieldFade::STEPS, FieldFade::FRAMES_PER_STEP);
+                    self.fade.begin(
+                        FadeDirection::In,
+                        FieldFade::STEPS,
+                        FieldFade::FRAMES_PER_STEP,
+                    );
                 }
                 if self.task_tick >= 7 {
                     self.phase = FieldPhase::Running;
@@ -1153,7 +1215,9 @@ impl FieldSystem {
                 let fade_out = t.fade_out_tick();
                 let fade_in = t.fade_in_tick();
                 match t.kind {
-                    TransitionKind::Stairs | TransitionKind::Door if t.tick == Transition::EXIT_WALK_TICK => {
+                    TransitionKind::Stairs | TransitionKind::Door
+                        if t.tick == Transition::EXIT_WALK_TICK =>
+                    {
                         // sub_0205613C state 1 / sub_02056040's door walk:
                         // one WalkSlower tile in the facing direction.
                         let dir = self.avatar.facing();
@@ -1163,8 +1227,11 @@ impl FieldSystem {
                 }
                 if t.tick == fade_out {
                     self.avatar.object.clear_held_movement_if_idle();
-                    self.fade
-                        .begin(FadeDirection::Out, FieldFade::STEPS, FieldFade::FRAMES_PER_STEP);
+                    self.fade.begin(
+                        FadeDirection::Out,
+                        FieldFade::STEPS,
+                        FieldFade::FRAMES_PER_STEP,
+                    );
                 }
                 if t.tick == fade_out + Transition::LOAD_AFTER_FADE_TICKS && !t.loaded {
                     t.stage = TransitionStage::Black;
@@ -1178,8 +1245,11 @@ impl FieldSystem {
                             message: error.to_string(),
                         });
                         self.avatar.object.clear_held_movement_if_idle();
-                        self.fade
-                            .begin(FadeDirection::In, FieldFade::STEPS, FieldFade::FRAMES_PER_STEP);
+                        self.fade.begin(
+                            FadeDirection::In,
+                            FieldFade::STEPS,
+                            FieldFade::FRAMES_PER_STEP,
+                        );
                         self.transition = None;
                         self.phase = FieldPhase::Running;
                         return;
@@ -1188,8 +1258,11 @@ impl FieldSystem {
                 }
                 if t.tick == fade_in {
                     t.stage = TransitionStage::Enter;
-                    self.fade
-                        .begin(FadeDirection::In, FieldFade::STEPS, FieldFade::FRAMES_PER_STEP);
+                    self.fade.begin(
+                        FadeDirection::In,
+                        FieldFade::STEPS,
+                        FieldFade::FRAMES_PER_STEP,
+                    );
                     let dir = self.avatar.facing();
                     self.hold(MovementCmd::for_direction(family::WALK_SLOWER, dir));
                 }
@@ -1230,6 +1303,17 @@ impl FieldSystem {
         kind: TransitionKind,
     ) -> Result<(), AssetsError> {
         let (scene, location) = Self::load_location(store, destination, self.gender)?;
+        let mut lighting = ModelLighting::default();
+        let archive = AreaLightArchive::load(
+            store,
+            archive_for_light_type(scene.area.light_selector, false),
+        )?;
+        self.area_lights = AreaLightManager::new(
+            archive,
+            (self.clock_seconds + self.ticks / 60) % 86_400,
+            &mut lighting,
+        );
+        self.lighting = lighting;
         self.previous = self.location;
         self.camera = scene.camera;
         self.scene = Arc::new(scene);
@@ -1285,6 +1369,7 @@ impl FieldSystem {
             scene: Arc::clone(&self.scene),
             camera: self.camera,
             camera_target: target,
+            lighting: Some(self.lighting),
             objects: vec![self.sprite.view(self.avatar.object.position)],
         });
         frame.main.bgs[0].enabled = true;
@@ -1507,7 +1592,11 @@ impl FieldSystem {
 /// camera target of a standing player.
 #[must_use]
 pub fn tile_centre(x: i32, z: i32) -> [i32; 3] {
-    [x * TILE_FX32 + TILE_FX32 / 2, 0, z * TILE_FX32 + TILE_FX32 / 2]
+    [
+        x * TILE_FX32 + TILE_FX32 / 2,
+        0,
+        z * TILE_FX32 + TILE_FX32 / 2,
+    ]
 }
 
 #[cfg(test)]
@@ -1536,7 +1625,10 @@ mod tests {
             fade.update();
             seen.push(fade.brightness());
         }
-        assert_eq!(seen, [down(2), down(5), down(7), down(10), down(13), down(16)]);
+        assert_eq!(
+            seen,
+            [down(2), down(5), down(7), down(10), down(13), down(16)]
+        );
         assert!(!fade.is_finished());
         fade.update();
         assert!(fade.is_finished());
@@ -1554,7 +1646,14 @@ mod tests {
         }
         assert_eq!(
             seen,
-            [down(13), down(10), down(8), down(5), down(2), MasterBrightness::default()]
+            [
+                down(13),
+                down(10),
+                down(8),
+                down(5),
+                down(2),
+                MasterBrightness::default()
+            ]
         );
     }
 
@@ -1564,6 +1663,9 @@ mod tests {
                 width: 32,
                 height: 32 * 32,
                 pixels: Vec::new(),
+                format: crate::formats::TexFmt::Pltt256,
+                color0_transparent: true,
+                raw: None,
             }),
             frame_size: (32, 32),
             frame_count: 32,
@@ -1608,7 +1710,9 @@ mod tests {
         // frames 4906-4941 (hero.9 and hero.11 are the same image).
         assert_eq!(
             shown,
-            [9, 10, 10, 10, 10, 10, 11, 11, 11, 11, 8, 8, 8, 8, 9, 9, 9, 9, 10]
+            [
+                9, 10, 10, 10, 10, 10, 11, 11, 11, 11, 8, 8, 8, 8, 9, 9, 9, 9, 10
+            ]
         );
     }
 

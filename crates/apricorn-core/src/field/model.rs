@@ -28,6 +28,23 @@ pub struct Texture {
     pub height: usize,
     /// Row-major RGBA8 pixels.
     pub pixels: Vec<[u8; 4]>,
+    /// Original GX texture format; retained for exact alpha expansion
+    /// and opaque/translucent polygon classification.
+    pub format: TexFmt,
+    /// Original `TEXIMAGE_PARAM` color-zero transparency flag.
+    pub color0_transparent: bool,
+    /// Original texels and palette. ROM textures retain this so the GX
+    /// sampler never reconstructs native values from RGBA8 review data.
+    pub raw: Option<RawTexture>,
+}
+
+/// Native texture payload retained through model parsing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawTexture {
+    /// Packed texels in the texture format's native bit layout.
+    pub texels: Vec<u8>,
+    /// Palette entries in native BGR555 form.
+    pub palette: Vec<u16>,
 }
 /// A GX vertex after node and placement transforms.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,22 +52,72 @@ pub struct Vertex {
     /// Coordinates with twelve fractional bits (model space from
     /// [`parse`], world space after [`place`]).
     pub position: [i32; 3],
+    /// Original GX vertex before POSSCALE and node/base transforms.
+    /// The renderer combines this with [`Mesh::gx_transform`] so matrix
+    /// quantization happens at the same boundary as on the DS.
+    pub gx_position: [i32; 3],
     /// Texture coordinates with four fractional bits.
     pub uv: [i16; 2],
     /// Vertex color in BGR555.
     pub color: u16,
+    /// Current GX normal in signed 1.9 form after the model's vector
+    /// matrix, or `None` when an explicit COLOR command owns the value.
+    pub normal: Option<[i16; 3]>,
 }
+
+/// One polygon emitted by a GX primitive stream.
+///
+/// Quads stay quads until the rasterizer.  The Nintendo DS interpolates
+/// and fills a four-vertex polygon as one polygon; eagerly splitting it
+/// into two host triangles introduces a synthetic diagonal and produces
+/// camera-dependent texel and coverage changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Primitive {
+    /// A three-vertex polygon.
+    Triangle([Vertex; 3]),
+    /// A four-vertex polygon.
+    Quad([Vertex; 4]),
+}
+
+impl Primitive {
+    /// Visits every vertex in primitive order.
+    #[must_use]
+    pub fn vertices(&self) -> &[Vertex] {
+        match self {
+            Self::Triangle(vertices) => vertices,
+            Self::Quad(vertices) => vertices,
+        }
+    }
+
+    fn map_vertices(self, mut transform: impl FnMut(Vertex) -> Vertex) -> Self {
+        match self {
+            Self::Triangle(vertices) => Self::Triangle(vertices.map(&mut transform)),
+            Self::Quad(vertices) => Self::Quad(vertices.map(&mut transform)),
+        }
+    }
+}
+
 /// A single material/shape draw from the model's SBC program.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Mesh {
-    /// Triangulated GX primitive stream, preserving draw order.
-    pub triangles: Vec<[Vertex; 3]>,
+    /// GX polygons in draw order. Triangle and quad strips are expanded
+    /// into their constituent polygons, but quads are never triangulated.
+    pub primitives: Vec<Primitive>,
+    /// Model/node/base transform retained until GX submission.
+    pub gx_transform: GxTransform,
     /// Bound texture; absent for solid-color shapes such as shadows.
     pub texture: Option<Arc<Texture>>,
     /// Material TEXIMAGE_PARAM, including repeat/flip bits.
     pub texture_flags: u32,
     /// Polygon alpha, 0–31.
     pub alpha: u8,
+    /// Raw GX `POLYGON_ATTR` material register (culling, depth mode,
+    /// fog, alpha, polygon id, and lighting mask).
+    pub polygon_attr: u32,
+    /// Raw GX `DIF_AMB` material word.
+    pub diffuse_ambient: u32,
+    /// Raw GX `SPE_EMI` material word.
+    pub specular_emission: u32,
 }
 
 /// One unit in fx32 (twelve fractional bits).
@@ -114,35 +181,59 @@ impl Placement {
 /// Copies `meshes` with every vertex run through `placement`.
 #[must_use]
 pub fn place(meshes: &[Mesh], placement: &Placement) -> Vec<Mesh> {
+    let placement_transform = GxTransform {
+        m: std::array::from_fn(|row| std::array::from_fn(|column| {
+            fx_mul(placement.rotation[row][column], placement.scale[column])
+        })),
+        t: placement.translation,
+    };
     meshes
         .iter()
         .map(|mesh| Mesh {
-            triangles: mesh
-                .triangles
+            primitives: mesh
+                .primitives
                 .iter()
-                .map(|tri| {
-                    tri.map(|v| Vertex {
-                        position: placement.apply(v.position),
-                        ..v
+                .copied()
+                .map(|primitive| {
+                    primitive.map_vertices(|vertex| Vertex {
+                        position: placement.apply(vertex.position),
+                        normal: vertex.normal.map(|normal| {
+                            std::array::from_fn(|row| {
+                                let value = (0..3)
+                                    .map(|column| {
+                                        i64::from(placement.rotation[row][column])
+                                            * i64::from(normal[column])
+                                    })
+                                    .sum::<i64>()
+                                    >> 12;
+                                value.clamp(-512, 511) as i16
+                            })
+                        }),
+                        ..vertex
                     })
                 })
                 .collect(),
+            gx_transform: placement_transform.mul(&mesh.gx_transform),
             texture: mesh.texture.clone(),
             texture_flags: mesh.texture_flags,
             alpha: mesh.alpha,
+            polygon_attr: mesh.polygon_attr,
+            diffuse_ambient: mesh.diffuse_ambient,
+            specular_emission: mesh.specular_emission,
         })
         .collect()
 }
 
 /// 4x3 fx32 affine matrix in column-vector form.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Mtx43 {
+pub struct GxTransform {
     m: [[i32; 3]; 3],
     t: [i32; 3],
 }
 
-impl Mtx43 {
-    const IDENTITY: Self = Self {
+impl GxTransform {
+    /// Identity transform.
+    pub const IDENTITY: Self = Self {
         m: [[FX32_ONE, 0, 0], [0, FX32_ONE, 0], [0, 0, FX32_ONE]],
         t: [0; 3],
     };
@@ -150,7 +241,9 @@ impl Mtx43 {
     fn apply(&self, v: [i32; 3]) -> [i32; 3] {
         let mut out = self.t;
         for r in 0..3 {
-            let acc = (0..3).map(|c| self.m[r][c] as i64 * v[c] as i64).sum::<i64>();
+            let acc = (0..3)
+                .map(|c| self.m[r][c] as i64 * v[c] as i64)
+                .sum::<i64>();
             out[r] += (acc >> 12) as i32;
         }
         out
@@ -161,7 +254,9 @@ impl Mtx43 {
         let mut m = [[0i32; 3]; 3];
         for r in 0..3 {
             for c in 0..3 {
-                let acc = (0..3).map(|k| self.m[r][k] as i64 * rhs.m[k][c] as i64).sum::<i64>();
+                let acc = (0..3)
+                    .map(|k| self.m[r][k] as i64 * rhs.m[k][c] as i64)
+                    .sum::<i64>();
                 m[r][c] = (acc >> 12) as i32;
             }
         }
@@ -169,6 +264,18 @@ impl Mtx43 {
             m,
             t: self.apply(rhs.t),
         }
+    }
+
+    /// Column-vector rotation/scale matrix.
+    #[must_use]
+    pub const fn matrix(&self) -> [[i32; 3]; 3] {
+        self.m
+    }
+
+    /// Fx32 translation.
+    #[must_use]
+    pub const fn translation(&self) -> [i32; 3] {
+        self.t
     }
 }
 
@@ -209,11 +316,7 @@ fn dict(b: &[u8], p: usize) -> Result<Vec<(&str, &[u8])>, NdsError> {
 /// # Errors
 /// Returns an [`NdsError`] when the texture or palette name is not in
 /// the archive or the pixel data is short.
-pub fn decode_texture(
-    btx: &Btx<'_>,
-    name: &str,
-    palette: &str,
-) -> Result<Texture, NdsError> {
+pub fn decode_texture(btx: &Btx<'_>, name: &str, palette: &str) -> Result<Texture, NdsError> {
     let tex = btx
         .texture_by_name(name)
         .ok_or(invalid("material texture binding"))?;
@@ -239,7 +342,9 @@ pub fn decode_texture(
                 TexFmt::A5i3 => (byte & 7, ((byte >> 3) as u16 * 255 / 31) as u8),
             };
             let rgb = u16le(pal.data(), index as usize * 2)?;
-            let a = if index == 0 && tex.color0_transparent() {
+            let a = if index == 0 && tex.color0_transparent()
+                && matches!(tex.fmt(), TexFmt::Pltt4 | TexFmt::Pltt16 | TexFmt::Pltt256)
+            {
                 0
             } else {
                 alpha
@@ -252,10 +357,26 @@ pub fn decode_texture(
             ])
         })
         .collect::<Result<Vec<_>, NdsError>>()?;
+    let palette_entries = match tex.fmt() {
+        TexFmt::Pltt4 => 4,
+        TexFmt::Pltt16 => 16,
+        TexFmt::Pltt256 => 256,
+        TexFmt::A3i5 => 32,
+        TexFmt::A5i3 => 8,
+    };
+    let native_palette = (0..palette_entries)
+        .map(|index| u16le(pal.data(), index * 2))
+        .collect::<Result<Vec<_>, NdsError>>()?;
     Ok(Texture {
         width: tex.width() as usize,
         height: tex.height() as usize,
         pixels,
+        format: tex.fmt(),
+        color0_transparent: tex.color0_transparent(),
+        raw: Some(RawTexture {
+            texels: tex.data().to_vec(),
+            palette: native_palette,
+        }),
     })
 }
 fn expand(v: u16) -> u8 {
@@ -276,7 +397,7 @@ fn fx16(b: &[u8], p: usize) -> Result<i32, NdsError> {
 /// and `[A B; C D]` on the other rows × columns, `C = ±B` (bit 9),
 /// `D = ±A` (bit 10). Retail bm_field prop 27's node 1 is the worked
 /// example: flag `0xFA4C`, a 40° pivot-Y rotation with `_00 == A`.
-fn node_matrix(m: &[u8], p: usize) -> Result<Mtx43, NdsError> {
+fn node_matrix(m: &[u8], p: usize) -> Result<GxTransform, NdsError> {
     let flag = u16le(m, p)?;
     let m00 = fx16(m, p + 2)?;
     let mut q = p + 4;
@@ -299,7 +420,11 @@ fn node_matrix(m: &[u8], p: usize) -> Result<Mtx43, NdsError> {
                 return Err(invalid("model node pivot index"));
             }
             let (pr, pc) = (idx / 3, idx % 3);
-            let one = if flag & 0x100 != 0 { -FX32_ONE } else { FX32_ONE };
+            let one = if flag & 0x100 != 0 {
+                -FX32_ONE
+            } else {
+                FX32_ONE
+            };
             let c = if flag & 0x200 != 0 { -b } else { b };
             let d = if flag & 0x400 != 0 { -a } else { a };
             let others = |i: usize| -> [usize; 2] {
@@ -315,7 +440,16 @@ fn node_matrix(m: &[u8], p: usize) -> Result<Mtx43, NdsError> {
             rows[rs[1]][cs[1]] = d;
         } else {
             rows[0][0] = m00;
-            let rest = [(0, 1), (0, 2), (1, 0), (1, 1), (1, 2), (2, 0), (2, 1), (2, 2)];
+            let rest = [
+                (0, 1),
+                (0, 2),
+                (1, 0),
+                (1, 1),
+                (1, 2),
+                (2, 0),
+                (2, 1),
+                (2, 2),
+            ];
             for (i, j) in rest {
                 rows[i][j] = fx16(m, q)?;
                 q += 2;
@@ -337,7 +471,7 @@ fn node_matrix(m: &[u8], p: usize) -> Result<Mtx43, NdsError> {
             out[r][c] = fx_mul(rows[c][r], s[c]);
         }
     }
-    Ok(Mtx43 { m: out, t })
+    Ok(GxTransform { m: out, t })
 }
 
 /// Parses a single-model BMD0 into model space: node SRTs applied
@@ -390,8 +524,8 @@ pub(crate) fn parse(b: &[u8], tex: &Btx<'_>) -> Result<Vec<Mesh>, NdsError> {
     let mut meshes = Vec::new();
     let mut p = u32le(m, 4)? as usize;
     let mut selected = 0;
-    let mut current = Mtx43::IDENTITY;
-    let mut stack: [Option<Mtx43>; 32] = [None; 32];
+    let mut current = GxTransform::IDENTITY;
+    let mut stack: [Option<GxTransform>; 32] = [None; 32];
     let mut scaled = false;
     let mut visible = true;
     while p < mat {
@@ -467,16 +601,28 @@ pub(crate) fn parse(b: &[u8], tex: &Btx<'_>) -> Result<Vec<Mesh>, NdsError> {
                     (None, None) => None,
                     _ => return Err(invalid("incomplete material binding")),
                 };
+                let polygon_attr = u32le(m, material + 12)?;
+                let diffuse_ambient = u32le(m, material + 4)?;
+                let specular_emission = u32le(m, material + 8)?;
                 meshes.push(Mesh {
-                    triangles: display_list(
+                    primitives: display_list(
                         dl,
                         if scaled { pos_scale } else { FX32_ONE },
                         &current,
-                        u16le(m, material + 4)? & 32767,
+                        diffuse_ambient as u16 & 32767,
                     )?,
+                    gx_transform: GxTransform {
+                        m: current.m.map(|row| row.map(|value| {
+                            fx_mul(value, if scaled { pos_scale } else { FX32_ONE })
+                        })),
+                        t: current.t,
+                    },
                     texture,
                     texture_flags: u32le(m, material + 20)?,
-                    alpha: ((u32le(m, material + 12)? >> 16) & 31) as u8,
+                    alpha: ((polygon_attr >> 16) & 31) as u8,
+                    polygon_attr,
+                    diffuse_ambient,
+                    specular_emission,
                 });
             }
             _ => return Err(invalid("unsupported field SBC opcode")),
@@ -490,15 +636,16 @@ fn sign10(v: u32) -> i32 {
 fn display_list(
     b: &[u8],
     scale: i32,
-    node: &Mtx43,
+    node: &GxTransform,
     initial: u16,
-) -> Result<Vec<[Vertex; 3]>, NdsError> {
+) -> Result<Vec<Primitive>, NdsError> {
     let mut p = 0;
     let mut position = [0i32; 3];
     let mut uv = [0; 2];
     let mut color = initial;
+    let mut normal = None;
     let mut vertices = Vec::new();
-    let mut triangles = Vec::new();
+    let mut primitives = Vec::new();
     let mut primitive = None;
     while p < b.len() {
         let ops = slice(b, p, 4)?.to_vec();
@@ -516,8 +663,17 @@ fn display_list(
             let a = if n > 0 { u32le(args, 0)? } else { 0 };
             match op {
                 0 => {}
-                0x20 => color = a as u16 & 32767,
-                0x21 => {}
+                0x20 => {
+                    color = a as u16 & 32767;
+                    normal = None;
+                }
+                0x21 => {
+                    normal = Some([
+                        sign10(a) as i16,
+                        sign10(a >> 10) as i16,
+                        sign10(a >> 20) as i16,
+                    ]);
+                }
                 0x22 => uv = [a as i16, (a >> 16) as i16],
                 0x23 => {
                     position = [
@@ -567,30 +723,52 @@ fn display_list(
                 ];
                 vertices.push(Vertex {
                     position: node.apply(local),
+                    gx_position: position,
                     uv,
                     color,
+                    normal: normal.map(|normal| {
+                        std::array::from_fn(|row| {
+                            let value = (0..3)
+                                .map(|column| i64::from(node.m[row][column]) * i64::from(normal[column]))
+                                .sum::<i64>()
+                                >> 12;
+                            value.clamp(-512, 511) as i16
+                        })
+                    }),
                 });
                 let n = vertices.len();
-                let ids = match primitive.unwrap() {
-                    0 if n % 3 == 0 => vec![[n - 3, n - 2, n - 1]],
-                    1 if n % 4 == 0 => vec![[n - 4, n - 3, n - 2], [n - 4, n - 2, n - 1]],
+                match primitive.unwrap() {
+                    0 if n % 3 == 0 => primitives.push(Primitive::Triangle([
+                        vertices[n - 3],
+                        vertices[n - 2],
+                        vertices[n - 1],
+                    ])),
+                    1 if n % 4 == 0 => primitives.push(Primitive::Quad([
+                        vertices[n - 4],
+                        vertices[n - 3],
+                        vertices[n - 2],
+                        vertices[n - 1],
+                    ])),
                     2 if n >= 3 => {
-                        if n % 2 == 1 {
-                            vec![[n - 3, n - 2, n - 1]]
+                        let ids = if n % 2 == 1 {
+                            [n - 3, n - 2, n - 1]
                         } else {
-                            vec![[n - 2, n - 3, n - 1]]
-                        }
+                            [n - 2, n - 3, n - 1]
+                        };
+                        primitives.push(Primitive::Triangle(ids.map(|i| vertices[i])));
                     }
-                    3 if n >= 4 && n % 2 == 0 => vec![[n - 4, n - 3, n - 1], [n - 4, n - 1, n - 2]],
-                    _ => vec![],
-                };
-                for ids in ids {
-                    triangles.push(ids.map(|i| vertices[i]));
+                    3 if n >= 4 && n % 2 == 0 => primitives.push(Primitive::Quad([
+                        vertices[n - 4],
+                        vertices[n - 3],
+                        vertices[n - 1],
+                        vertices[n - 2],
+                    ])),
+                    _ => {}
                 }
             }
         }
     }
-    Ok(triangles)
+    Ok(primitives)
 }
 
 #[cfg(test)]
@@ -621,11 +799,11 @@ mod tests {
 
     #[test]
     fn matrix_product_applies_rhs_first() {
-        let t = Mtx43 {
+        let t = GxTransform {
             t: [FX32_ONE, 0, 0],
-            ..Mtx43::IDENTITY
+            ..GxTransform::IDENTITY
         };
-        let r = Mtx43 {
+        let r = GxTransform {
             m: [[0, 0, FX32_ONE], [0, FX32_ONE, 0], [-FX32_ONE, 0, 0]],
             t: [0; 3],
         };
@@ -654,6 +832,6 @@ mod tests {
     #[test]
     fn identity_node_is_identity() {
         let rec = [0x07, 0x00, 0x00, 0x10];
-        assert_eq!(node_matrix(&rec, 0).unwrap(), Mtx43::IDENTITY);
+        assert_eq!(node_matrix(&rec, 0).unwrap(), GxTransform::IDENTITY);
     }
 }

@@ -232,6 +232,83 @@ the bedroom's first fully-faded-in frame. Its `README.md` records every
 milestone frame with the exact input events, and the review set it
 names is the visual ground truth for the engine's new-game path.
 
+## Raw 3D snapshots (`--gx-shots`)
+
+```
+apricorn-replay --gx-shots 4816-4824 --gx-shots-dir out/oracle-gx corpus/new-game
+```
+
+The raw snapshot path bypasses engine A/B composition. It reads the
+completed software 3D renderer's topmost colour, depth, and attribute
+buffers and writes `<dir>/frame_%06u_gx3d.bin`. The format is
+little-endian:
+
+```
+u8[8] magic = "APGX3D1\0"
+u32   width = 256
+u32   height = 192
+repeat width * height times, row-major:
+    u32 color
+    u32 depth
+    u32 attributes
+```
+
+`color` is melonDS's native packed software-renderer word. `depth` is
+the value used by its depth test. `attributes` retains edge coverage,
+fog, translucency, and polygon-id bits. The accessors exist only in the
+patched oracle build; no melonDS code or data is linked into apricorn.
+
+Rust side: `oracle::GxShotRequest` drives capture and
+`oracle::Gx3dSnapshot` validates and parses it. `color_change_mask`
+produces one boolean per pixel, allowing a sequence to require that
+both every frame and every inter-frame changed-pixel mask equals the
+oracle. LCD screenshots and raw snapshots may be requested together.
+
+Each raw capture also writes `frame_%06u_gxgeo.bin` (magic `APGXGEO1`):
+five u32 words for display control, clear colour/attributes, clear depth,
+flush attributes and polygon count; three 16-word matrices (projection,
+current position, current clip); then the sorted polygon records. Each
+record has eight u32 words (polygon attributes, texture parameters,
+palette base, vertex count, type, sort key, W-buffer flag, diagnostic
+flags), followed by thirteen words per vertex (clip XYZW, screen XY,
+depth, W, colour RGB, texture UV). Signed words use two's complement.
+The current matrices are the last submitted GX state, **not necessarily
+the camera matrices**. `gxregs.bin` is an unversioned diagnostic dump
+of eight edge colours, 32 toon colours, fog colour, fog offset and shift.
+These artifacts expose observed oracle state, not renderer code.
+
+### Exact motion gate
+
+```
+cargo run -p apricorn-harness --bin apricorn-gx-diff -- --sequence oracle/sequences/bedroom-down.tsv
+```
+
+The TSV contains expected/actual paths relative to its own directory, in
+display order. Repeated frames must remain in the list. Every frame is
+compared across colour/alpha, depth and attributes, and every transition
+compares the exact colour-change mask. Exit 0 means all comparisons are
+exact, 1 means a mismatch, and 64 means invalid/missing input. Empty and
+single-frame manifests cannot pass a motion gate. Do not crop furniture,
+mask shadows, apply tolerance, or update engine goldens to bypass a failure.
+
+Generate the current bedroom pair set with:
+
+```powershell
+cargo run -p apricorn-harness --bin apricorn-replay -- --rom hg_usa.nds --hold DOWN 4808-4850 --gx-shots 4808-4850 --gx-shots-dir out/oracle-gx-motion-down corpus/new-game
+$env:APRICORN_RENDER_OUT = Join-Path (Get-Location) 'out/ds-render-review'
+cargo test -p apricorn-gfx --test field_system_hg bedroom_walk_has_a_pinned_contiguous_raster_sequence -- --nocapture
+```
+
+The engine test writes all artifacts before checking its older goldens.
+Those goldens are intentionally not approved replacements yet: this
+sequence currently fails exact parity. `--hold` changes only the in-memory
+capture input, not the corpus baseline; its last frame is the release event.
+
+For visual review also run `house_furniture_contiguous_review_sequence`
+and `new_bark_arrival_golden` with the same output directory. Inspect the
+actual PNGs yourself, including multiple camera offsets outdoors. This
+is complementary to the exact gate, never a substitute.
+
 ## Usage
 
 ```
@@ -240,9 +317,10 @@ apricorn-oracle run --rom hg_usa.nds --out trace.txt
     [--frames 600] [--rtc 2010-03-01T09:00:00]
     --input-sha1 HEX --regions-sha1 HEX [--producer oracle-melonds-1.1]
     [--shots F,F,... --shots-dir DIR]
+    [--gx-shots F,F,... --gx-shots-dir DIR]
 ```
 
 Exit 0 on success, 2 on runtime failure (bad blob, unreadable ROM,
 unwritable screenshot), 3 when the machine stopped before the requested
-frame count, 64 on usage errors (including `--shots` without
-`--shots-dir` or a malformed frame list).
+frame count, 64 on usage errors (including a screenshot flag without
+its directory or a malformed frame list).

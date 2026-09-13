@@ -218,13 +218,22 @@ what the demo script and the window are for.
 ## Field (3D) layer
 
 `apricorn-gfx::field` draws the overworld: the picture engine A's BG0
-shows while a map is up. This is the crate's one documented exception
-to "no floating point" — `f64` with a fixed evaluation order and no
-transcendental call in the render path (the SDK's sine table is
-regenerated once from `sin`/`cos` rounded to fx16 and pinned by SHA-1
-against the vendored table), so a scene still renders bit-identically
-on every platform (the SHA-1 goldens in `tests/field_hg.rs` are the
-proof, as `tests/raster_hg.rs` is for the 2D path).
+shows while a map is up. The production path now projects and
+rasterizes through `gx3d`: signed fixed-point matrices, the DS viewport
+divider, integer screen vertices, scanline spans, 24-bit depth and
+fixed-point perspective attributes. The SDK sine table is generated
+as a build-time constant; no floating-point operation occurs while a
+field frame is rendered.
+
+Opaque silhouettes use the GX left/right edge-ownership rules instead
+of filling both sides of every span. Outdoor maps add one narrowly
+scoped safety pass after opaque land cells and before props: an
+alpha-zero pixel is sealed only when the original land buffer covers
+both horizontal neighbours or both vertical neighbours. The pass reads
+a snapshot, so it cannot grow a silhouette or bridge a gap wider than
+one pixel. This removes the black one-pixel cell cracks exposed by the
+transparent 3D clear plane without reintroducing bright roof and room
+outline texels.
 
 ### What the original does
 
@@ -315,10 +324,10 @@ pitch `0xDC82`, half-angle `0x281`; both near 150, far 1200 / 1736.
 * **Viewport.** `G3_ViewPort(0, 0, 255, 191)`: NDC x → 0..256, NDC
   y → rows 192..0; depth is NDC z (smaller nearer), tested with
   `z ≤ stored + ε` so coplanar decals drawn later still show.
-* **Deviation.** The SDK builds the matrices in fx32; this port builds
-  them in `f64` from the fx32 inputs, so vertices land within a small
-  fraction of a pixel of the hardware's. No near-plane clipping: a
-  triangle with a vertex behind the eye is dropped whole.
+* **Viewport precision.** The production matrices are signed 20.12.
+  Projected coordinates become integers before scan conversion. When
+  W exceeds 16 bits the viewport divider drops one numerator bit, as
+  the geometry engine does; depth is retained as a 24-bit integer.
 
 ### The billboard "shear" and map objects (`field/billboard.rs`)
 
@@ -345,7 +354,7 @@ space*. The quad is `x ∈ [−16, 16], y ∈ [0, 32], z = 0` with texture
 anchored at the **feet**, 32 units tall, camera-facing. `BillboardView
 { texture, rect, world_pos, size_px }` places such a quad: the corners
 are built in camera space from the projected anchor, projected through
-the biased matrix, and rasterized as two opaque triangles. Which
+the biased matrix, and rasterized as one GX quad. Which
 texture, direction and walk frame to show is the map-object model's
 concern; the view takes a texture and a texel rectangle.
 
@@ -356,18 +365,45 @@ moves the sprite up by the 4 rows the old offset added.
 
 ### Rasterizer
 
-Triangles are sampled at pixel centres with a top-left fill rule (a
-shared edge is drawn exactly once, so translucent seams do not
-double-blend — the old rule drew both sides), attributes are
-interpolated perspective-correctly (`attr/w`, `1/w`), texels are
-nearest with `TEXIMAGE_PARAM`'s repeat/flip bits, colour is modulated
-by the interpolated 5-bit vertex colour (`texel · (c+1) / 32`), and the
-polygon alpha scales the texel alpha. Translucent pixels blend
-`src·a + dst·(255−a)` over a drawn pixel and *replace* a clear one
-(alpha 0), keeping the larger alpha — the 3D core's rule. Opaque meshes
-draw with depth writes, then billboards, then translucent meshes
-(polygon alpha < 31) in model order without depth writes; NDS auto
-sorting of translucent polygons is not modelled.
+GX triangles and quads retain their primitive identity through model
+placement and enter an integer scanline converter directly; strips are
+expanded to the same primitive kind, never to a synthetic quad
+diagonal. Edge ownership depends on winding, slope and display state,
+including one-row and overlapping-edge cases. Attributes use quantized
+perspective factors, and texels use `TEXIMAGE_PARAM` repeat/flip rules.
+The sampler retains the original texels/palette for all five formats
+used by HeartGold. Native colour and alpha precision is six and five
+bits respectively; indexed colour-zero transparency does not override
+the explicit alpha in A3I5/A5I3 (GBATEK, TEXIMAGE_PARAM bit 29).
+
+Model-local GX vertices and model/node/POSSCALE matrices remain separate
+until camera submission. Baking vertices into world coordinates before
+concatenating the matrices changes fixed-point rounding and is not
+equivalent. Clipping anchors intersections at the outside endpoint so
+shared edges produce identical intersections in either traversal direction.
+
+Auto-sort uses opacity and polygon Y bounds, preserving submission order
+on ties. Per-pixel alpha testing precedes writes. The two pixel layers
+retain native depth, opaque/translucent polygon IDs, fog eligibility,
+edge flags and coverage. Implemented paths include Z/W selection,
+translucent depth-update flags, shadow stencil, toon/highlight, four-light
+normal shading and shininess. Resolve applies edge marking, fog, then AA.
+These paths have synthetic tests, **not yet complete hardware parity**.
+
+The earlier AA-disabled claim was wrong for the live field: the captured
+retail bedroom at VBlank 4822 has `DISP3DCNT=0x0039`, enabling texture,
+alpha blending, antialiasing and edge marking. Its edge palette is black
+for IDs 0–7 and `0x1084` for the other groups. Both the production
+compositor and raw capture now obtain this configuration through
+`field_registers`; the earlier initialization call to
+`G3X_AntiAlias(FALSE)` is not the final live state.
+
+Still outside the whole-core claim: complete GX command/matrix-stack
+execution, per-command material changes and texture matrices, DIRECT and
+COMP4x4 texture formats, and oracle-validated corner cases for lighting,
+W depth, shadows, fog and AA. The retail ground-shadow effect is also
+missing from field submission; having a shadow raster mode does not
+create that geometry automatically.
 
 ### Seams for the map-data `FieldScene`
 
@@ -413,7 +449,8 @@ the testable manual check without a window.
 
 ### The desktop shell (`apricorn-desktop`, bin `apricorn`)
 
-`cargo run -p apricorn-desktop [--rom <path>]` — winit window +
+`cargo run -p apricorn-desktop [--rom <path>]`
+— winit window +
 wgpu present, the Phase 3 exit criterion. The presenter uploads both
 screens to two 256×192 `Rgba8Unorm` textures and draws two quads of a
 trivial WGSL blit; the layout is the largest integer scale of the
@@ -422,6 +459,9 @@ The surface format is deliberately the first *non-sRGB* one: the
 rasterizer emits display-ready sRGB bytes, and an sRGB target would
 re-encode them. `PresentMode::Fifo` (vsync) throttles redraws;
 redraws are only requested when a tick produces a new frame.
+
+Persistent desktop saves are a separate local workstream, not part of
+this renderer PR. This branch leaves the desktop lifecycle unchanged.
 
 The quads' UV mapping carries a pinned invariant: the quad's corner
 (u,v)=(0,0) is its top-left in NDC *and* row 0 of the buffer — the
@@ -492,12 +532,32 @@ upward: from Phase 4 the harness can hash logical-frame regions into
 the trace corpus alongside the RAM-watch regions, giving
 divergence-pointing comparison *below* pixels too.
 
-Oracle visual comparison (rendering the melonDS oracle's frames and
-diffing against ours) is explicitly **out of scope for now**: the
-hash-pinned deterministic pipeline plus human review of the demo
-output and the window is the agreed bar for Phase 3. When visual
-diffing becomes worth its cost (GPU rendering, subtle blend cases),
-the oracle's framebuffer becomes one more trace source.
+The melonDS oracle can now dump the software 3D core before 2D
+composition as `APGX3D1` files: native colour, depth, and polygon
+attribute words for every 256×192 pixel. `Gx3dSnapshot` parses them and
+can compare exact colour-change masks between consecutive frames. This
+is the gate for renderer work; engine-only goldens pin determinism but
+do not by themselves establish hardware equality.
+
+The repeatable motion command and capture instructions are in
+[`docs/oracle.md`](oracle.md#exact-motion-gate). The 2026-09-12 run is
+**not exact**: ten bedroom frames have 29–63 colour, 0–5 depth and
+28–39 attribute mismatches each. These are measurements of the original
+combined local worktree, not proof of this isolated PR's parity. Coverage matches in all ten; eight
+transition masks match and one differs at one pixel. Existing field
+goldens remain unmodified rather than blessing those mismatches.
+
+The renderer-only performance gate is:
+
+```
+cargo test -p apricorn-gfx --release --test field_system_hg new_bark_release_frame_budget -- --ignored --nocapture
+```
+
+It warms up 24 frames, then times 120 New Bark frames without disk I/O,
+loading or simulation. Historical combined-worktree result: mean 4.113 ms, p95 5.191 ms,
+maximum 6.072 ms. The assertion requires every measured frame below
+16.714 ms. Composition/presentation and desktop backlog need separate
+measurement; this result must not be presented as their verification.
 
 ## Versions
 

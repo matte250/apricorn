@@ -4,6 +4,10 @@ Hör till [PLAN, fas 5B](../../PLAN.md). Reviderad 2026-09-12.
 Alla implementationskort nedan är öppna. Befintlig kod är en utgångspunkt,
 inte bevis på hårdvaruexakthet. Huvudkryssen finns i PLAN; här bockas delarna av.
 
+Det isolerade implementationsutkastets omfattning och testresultat finns i
+[renderer-pr-2026-09-13.md](renderer-pr-2026-09-13.md). Inga paritetskort
+bockas av genom denna checkpoint.
+
 ## Körordning och gräns för varje PR
 
 Börja med 5B.01a och 5B.09a: identifiera underlaget och isolera den saknade
